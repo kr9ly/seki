@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -16,11 +17,18 @@ const (
 	Prompt = "prompt"
 )
 
+// Kind constants.
+const (
+	KindNetwork = ""        // default: network rule (domain glob / CIDR)
+	KindCommand = "command" // command rule (regex)
+)
+
 // Rule defines a single matching rule.
 type Rule struct {
 	Match  string `json:"match"`
 	Action string `json:"action"`
 	Tag    string `json:"tag,omitempty"`
+	Kind   string `json:"kind,omitempty"` // "" = network, "command" = command
 }
 
 // RuleSet is the complete rule configuration.
@@ -72,11 +80,14 @@ func (rs *RuleSet) Save() error {
 	return os.WriteFile(path, data, 0644)
 }
 
-// Evaluate checks a domain and/or IP against the rules.
-// First matching rule wins.
+// Evaluate checks a domain and/or IP against network rules.
+// First matching rule wins. Default: deny.
 func (rs *RuleSet) Evaluate(domain, ip string) Result {
 	for i := range rs.Rules {
 		r := &rs.Rules[i]
+		if r.Kind == KindCommand {
+			continue
+		}
 		if matchRule(r.Match, domain, ip) {
 			res := Result{Action: r.Action, Rule: r}
 			if (r.Action == Deny || r.Action == Prompt) && rs.LearningMode {
@@ -86,7 +97,7 @@ func (rs *RuleSet) Evaluate(domain, ip string) Result {
 			return res
 		}
 	}
-	// Default deny
+	// Default deny (whitelist)
 	res := Result{Action: Deny}
 	if rs.LearningMode {
 		res.Learned = true
@@ -95,21 +106,42 @@ func (rs *RuleSet) Evaluate(domain, ip string) Result {
 	return res
 }
 
-// AddRule appends a rule. If a rule with the same match already exists, it's updated.
-func (rs *RuleSet) AddRule(match, action, tag string) {
+// EvaluateCommand checks a command string against command rules.
+// First matching rule wins. Default: allow (blacklist).
+func (rs *RuleSet) EvaluateCommand(cmd string) Result {
+	for i := range rs.Rules {
+		r := &rs.Rules[i]
+		if r.Kind != KindCommand {
+			continue
+		}
+		if matchCommand(r.Match, cmd) {
+			return Result{Action: r.Action, Rule: r}
+		}
+	}
+	// Default allow (blacklist)
+	return Result{Action: Allow}
+}
+
+// AddRule appends a rule. If a rule with the same match and kind already exists, it's updated.
+func (rs *RuleSet) AddRule(match, action, tag, kind string) {
 	for i, r := range rs.Rules {
-		if r.Match == match {
+		if r.Match == match && r.Kind == kind {
 			rs.Rules[i].Action = action
 			rs.Rules[i].Tag = tag
 			return
 		}
 	}
-	// Insert before the default deny rule (last rule)
-	newRule := Rule{Match: match, Action: action, Tag: tag}
-	if len(rs.Rules) > 0 && rs.Rules[len(rs.Rules)-1].Match == "*" {
-		rs.Rules = append(rs.Rules[:len(rs.Rules)-1], newRule, rs.Rules[len(rs.Rules)-1])
-	} else {
+	newRule := Rule{Match: match, Action: action, Tag: tag, Kind: kind}
+	if kind == KindCommand {
+		// Command rules append at end (no catch-all)
 		rs.Rules = append(rs.Rules, newRule)
+	} else {
+		// Network rules insert before the default deny rule (last network rule)
+		if len(rs.Rules) > 0 && rs.Rules[len(rs.Rules)-1].Match == "*" && rs.Rules[len(rs.Rules)-1].Kind != KindCommand {
+			rs.Rules = append(rs.Rules[:len(rs.Rules)-1], newRule, rs.Rules[len(rs.Rules)-1])
+		} else {
+			rs.Rules = append(rs.Rules, newRule)
+		}
 	}
 }
 
@@ -122,6 +154,15 @@ func (rs *RuleSet) RemoveRule(match string) bool {
 		}
 	}
 	return false
+}
+
+// matchCommand checks a command string against a regex pattern.
+func matchCommand(pattern, cmd string) bool {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return false
+	}
+	return re.MatchString(cmd)
 }
 
 // DefaultRuleSet returns a minimal starting ruleset in learning mode.

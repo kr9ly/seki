@@ -18,7 +18,7 @@ import (
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: seki <command> [args...]")
-		fmt.Fprintln(os.Stderr, "commands: exec, log, rules, query, watch, mode")
+		fmt.Fprintln(os.Stderr, "commands: exec, log, rules, check, query, watch, mode")
 		os.Exit(1)
 	}
 
@@ -31,6 +31,8 @@ func main() {
 		cmdLog()
 	case "rules":
 		cmdRules()
+	case "check":
+		cmdCheck()
 	case "query":
 		cmdQuery()
 	case "watch":
@@ -171,8 +173,9 @@ func cmdWatch() {
 
 	// Approval queue state (local mirror)
 	type queueItem struct {
-		domain string
-		dest   string
+		domain  string
+		dest    string
+		command string // non-empty for command approvals
 	}
 	var queue []queueItem
 	var queueMu sync.Mutex
@@ -195,9 +198,14 @@ func cmdWatch() {
 			if i == 0 {
 				prefix = inverse + "❯ " + reset
 			}
-			label := item.domain
-			if item.dest != "" && item.dest != item.domain {
-				label = item.dest + " (" + item.domain + ")"
+			var label string
+			if item.command != "" {
+				label = "cmd: " + item.command
+			} else {
+				label = item.domain
+				if item.dest != "" && item.dest != item.domain {
+					label = item.dest + " (" + item.domain + ")"
+				}
 			}
 			if i == 0 {
 				fmt.Printf("%s%s — %s[a]%sllow %s[d]%seny%s\n", prefix, label, bold, reset, bold, reset, reset)
@@ -301,7 +309,7 @@ func cmdWatch() {
 			case "approve":
 				queueMu.Lock()
 				for i, item := range queue {
-					if item.domain == e.Domain {
+					if item.domain == e.Domain && item.command == "" {
 						queue = append(queue[:i], queue[i+1:]...)
 						break
 					}
@@ -313,7 +321,7 @@ func cmdWatch() {
 			case "deny":
 				queueMu.Lock()
 				for i, item := range queue {
-					if item.domain == e.Domain {
+					if item.domain == e.Domain && item.command == "" {
 						queue = append(queue[:i], queue[i+1:]...)
 						break
 					}
@@ -321,14 +329,52 @@ func cmdWatch() {
 				queueMu.Unlock()
 				fmt.Printf("%s✗ denied: %s%s\n", red, e.Domain, reset)
 				renderQueue()
+
+			case "cmd":
+				tag := ""
+				if e.Tag != "" {
+					tag = dim + " [" + e.Tag + "]" + reset
+				}
+				fmt.Printf("%scmd%s  %s%s\n", dim, reset, e.Command, tag)
+
+			case "cmd_approval":
+				queueMu.Lock()
+				queue = append(queue, queueItem{command: e.Command})
+				queueMu.Unlock()
+				fmt.Printf("%scmd%s  %s — %s⏳ pending%s\n", cyan, reset, e.Command, cyan, reset)
+				renderQueue()
+
+			case "cmd_approve":
+				queueMu.Lock()
+				for i, item := range queue {
+					if item.command == e.Command {
+						queue = append(queue[:i], queue[i+1:]...)
+						break
+					}
+				}
+				queueMu.Unlock()
+				fmt.Printf("%s✓ approved cmd: %s%s\n", green, e.Command, reset)
+				renderQueue()
+
+			case "cmd_deny":
+				queueMu.Lock()
+				for i, item := range queue {
+					if item.command == e.Command {
+						queue = append(queue[:i], queue[i+1:]...)
+						break
+					}
+				}
+				queueMu.Unlock()
+				fmt.Printf("%s✗ denied cmd: %s%s\n", red, e.Command, reset)
+				renderQueue()
 			}
 
 		case key := <-keys:
 			queueMu.Lock()
 			hasItems := len(queue) > 0
-			var domain string
+			var first queueItem
 			if hasItems {
-				domain = queue[0].domain
+				first = queue[0]
 			}
 			queueMu.Unlock()
 
@@ -338,9 +384,17 @@ func cmdWatch() {
 
 			switch key {
 			case 'a', 'A':
-				client.Emit(socket.Event{Type: "approve", Domain: domain})
+				if first.command != "" {
+					client.Emit(socket.Event{Type: "cmd_approve", Command: first.command})
+				} else {
+					client.Emit(socket.Event{Type: "approve", Domain: first.domain})
+				}
 			case 'd', 'D':
-				client.Emit(socket.Event{Type: "deny", Domain: domain})
+				if first.command != "" {
+					client.Emit(socket.Event{Type: "cmd_deny", Command: first.command})
+				} else {
+					client.Emit(socket.Event{Type: "deny", Domain: first.domain})
+				}
 			}
 		}
 	}
@@ -370,18 +424,23 @@ func cmdRules() {
 			if r.Tag != "" {
 				tag = " [" + r.Tag + "]"
 			}
-			fmt.Printf("  %-6s %s%s\n", r.Action, r.Match, tag)
+			kind := ""
+			if r.Kind == rules.KindCommand {
+				kind = " (command)"
+			}
+			fmt.Printf("  %-6s %s%s%s\n", r.Action, r.Match, kind, tag)
 		}
 
 	case "add":
-		// seki rules add "*.github.com" --allow --tag git
+		// seki rules add "*.github.com" --allow --tag git [--command]
 		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "usage: seki rules add <match> --allow|--deny|--prompt [--tag <tag>]")
+			fmt.Fprintln(os.Stderr, "usage: seki rules add <match> --allow|--deny|--prompt [--tag <tag>] [--command]")
 			os.Exit(1)
 		}
 		match := os.Args[3]
 		action := rules.Allow
 		tag := ""
+		kind := rules.KindNetwork
 		for i := 4; i < len(os.Args); i++ {
 			switch os.Args[i] {
 			case "--allow":
@@ -390,6 +449,8 @@ func cmdRules() {
 				action = rules.Deny
 			case "--prompt":
 				action = rules.Prompt
+			case "--command":
+				kind = rules.KindCommand
 			case "--tag":
 				if i+1 < len(os.Args) {
 					tag = os.Args[i+1]
@@ -397,12 +458,16 @@ func cmdRules() {
 				}
 			}
 		}
-		rs.AddRule(match, action, tag)
+		rs.AddRule(match, action, tag, kind)
 		if err := rs.Save(); err != nil {
 			fmt.Fprintf(os.Stderr, "seki rules: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("added: %s %s\n", action, match)
+		prefix := ""
+		if kind == rules.KindCommand {
+			prefix = "[command] "
+		}
+		fmt.Printf("added: %s%s %s\n", prefix, action, match)
 
 	case "remove":
 		if len(os.Args) < 4 {
@@ -423,6 +488,86 @@ func cmdRules() {
 	default:
 		fmt.Fprintf(os.Stderr, "seki rules: unknown subcommand %q\n", os.Args[2])
 		os.Exit(1)
+	}
+}
+
+func cmdCheck() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: seki check <command>")
+		os.Exit(1)
+	}
+	cmd := strings.Join(os.Args[2:], " ")
+
+	rs, err := rules.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki check: %v\n", err)
+		os.Exit(1)
+	}
+
+	res := rs.EvaluateCommand(cmd)
+	switch res.Action {
+	case rules.Allow:
+		// Silent allow
+		return
+	case rules.Deny:
+		tag := ""
+		if res.Rule != nil && res.Rule.Tag != "" {
+			tag = " [" + res.Rule.Tag + "]"
+		}
+		fmt.Fprintf(os.Stderr, "[seki] blocked: %s%s\n", cmd, tag)
+		os.Exit(2) // exit 2 = BLOCK for Claude Code hooks
+	case rules.Prompt:
+		// Connect to socket and wait for approval
+		client, err := socket.Connect(false)
+		if err != nil {
+			// No socket = no watch = deny (safe default)
+			fmt.Fprintf(os.Stderr, "[seki] blocked (no watch): %s\n", cmd)
+			os.Exit(2)
+		}
+		defer client.Close()
+
+		// Send command approval request
+		client.Emit(socket.Event{
+			Type:    "cmd_approval",
+			Command: cmd,
+			Action:  "prompt",
+		})
+
+		// Wait for response
+		timeout := time.After(30 * time.Second)
+		events := make(chan socket.Event, 10)
+		go func() {
+			for client.Next() {
+				e, err := client.Event()
+				if err != nil {
+					continue
+				}
+				events <- e
+			}
+			close(events)
+		}()
+
+		for {
+			select {
+			case e, ok := <-events:
+				if !ok {
+					fmt.Fprintf(os.Stderr, "[seki] blocked (disconnected): %s\n", cmd)
+					os.Exit(2)
+				}
+				if e.Command == cmd {
+					switch e.Type {
+					case "cmd_approve":
+						return // allow
+					case "cmd_deny":
+						fmt.Fprintf(os.Stderr, "[seki] denied: %s\n", cmd)
+						os.Exit(2)
+					}
+				}
+			case <-timeout:
+				fmt.Fprintf(os.Stderr, "[seki] blocked (timeout): %s\n", cmd)
+				os.Exit(2)
+			}
+		}
 	}
 }
 

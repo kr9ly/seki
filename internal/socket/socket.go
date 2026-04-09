@@ -13,7 +13,7 @@ import (
 
 // Event is a real-time notification exchanged between seki components.
 type Event struct {
-	Type    string `json:"type"`              // "dns", "tcp", "status", "approval", "approve", "deny"
+	Type    string `json:"type"`              // "dns", "tcp", "status", "approval", "approve", "deny", "cmd", "cmd_approval", "cmd_approve", "cmd_deny"
 	Time    string `json:"time,omitempty"`
 	Domain  string `json:"domain,omitempty"`
 	QType   string `json:"qtype,omitempty"`
@@ -22,6 +22,7 @@ type Event struct {
 	Action  string `json:"action,omitempty"`  // "allow", "deny", "prompt"
 	Tag     string `json:"tag,omitempty"`
 	Learned bool   `json:"learned,omitempty"` // would deny in learning mode
+	Command string `json:"command,omitempty"` // command string (for cmd events)
 	// Status event fields
 	Session      string `json:"session,omitempty"`
 	LearningMode bool   `json:"learning_mode,omitempty"`
