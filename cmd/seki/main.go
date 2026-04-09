@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/netns"
@@ -30,13 +32,11 @@ func main() {
 	case "rules":
 		cmdRules()
 	case "query":
-		fmt.Fprintln(os.Stderr, "seki query: not yet implemented")
-		os.Exit(1)
+		cmdQuery()
 	case "watch":
 		cmdWatch()
 	case "mode":
-		fmt.Fprintln(os.Stderr, "seki mode: not yet implemented")
-		os.Exit(1)
+		cmdMode()
 	default:
 		fmt.Fprintf(os.Stderr, "seki: unknown command %q\n", os.Args[1])
 		os.Exit(1)
@@ -423,6 +423,116 @@ func cmdRules() {
 	default:
 		fmt.Fprintf(os.Stderr, "seki rules: unknown subcommand %q\n", os.Args[2])
 		os.Exit(1)
+	}
+}
+
+func cmdMode() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: seki mode <learning|enforce>")
+		os.Exit(1)
+	}
+	rs, err := rules.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki mode: %v\n", err)
+		os.Exit(1)
+	}
+	switch os.Args[2] {
+	case "learning":
+		rs.LearningMode = true
+	case "enforce":
+		rs.LearningMode = false
+	default:
+		fmt.Fprintf(os.Stderr, "seki mode: unknown mode %q (use learning or enforce)\n", os.Args[2])
+		os.Exit(1)
+	}
+	if err := rs.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "seki mode: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("mode: %s\n", os.Args[2])
+}
+
+func cmdQuery() {
+	since := 5 * time.Second
+	format := "text"
+
+	for i := 2; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		if strings.HasPrefix(arg, "--since=") {
+			d, err := time.ParseDuration(strings.TrimPrefix(arg, "--since="))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "seki query: invalid duration: %v\n", err)
+				os.Exit(1)
+			}
+			since = d
+		} else if strings.HasPrefix(arg, "--format=") {
+			format = strings.TrimPrefix(arg, "--format=")
+		}
+	}
+
+	log, err := logger.OpenReadOnly()
+	if err != nil {
+		// No database = no events = nothing to report
+		return
+	}
+	defer log.Close()
+
+	entries, err := log.QuerySince(since)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki query: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Filter to non-allow actions
+	var blocked []logger.Entry
+	for _, e := range entries {
+		if e.Action != "" && e.Action != rules.Allow {
+			blocked = append(blocked, e)
+		}
+	}
+
+	if len(blocked) == 0 {
+		return // nothing to report
+	}
+
+	if format == "hook" {
+		// Deduplicate by domain+action for concise hook output
+		type key struct{ domain, action string }
+		seen := make(map[key]bool)
+		var lines []string
+		for _, e := range blocked {
+			domain := e.Domain
+			if domain == "" {
+				domain = e.Dest
+			}
+			k := key{domain, e.Action}
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			switch e.Action {
+			case rules.Deny:
+				lines = append(lines, fmt.Sprintf("  %s — blocked (denied by rule)", domain))
+			case rules.Prompt:
+				lines = append(lines, fmt.Sprintf("  %s — blocked (approval required, use seki watch)", domain))
+			default:
+				lines = append(lines, fmt.Sprintf("  %s — %s", domain, e.Action))
+			}
+		}
+		fmt.Println("[seki] network access was blocked:")
+		for _, l := range lines {
+			fmt.Println(l)
+		}
+		return
+	}
+
+	// Default text format
+	for _, e := range blocked {
+		domain := e.Domain
+		if domain == "" {
+			domain = e.Dest
+		}
+		fmt.Printf("%s  %-4s  %-6s  %s\n", e.Time, e.Kind, e.Action, domain)
 	}
 }
 

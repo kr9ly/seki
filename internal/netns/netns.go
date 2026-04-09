@@ -296,7 +296,7 @@ func ChildSetup() (*ChildState, error) {
 		if res.Rule != nil && res.Rule.Tag != "" {
 			ruleTag = res.Rule.Tag
 		}
-		log.LogDNS(q.Domain, q.QType)
+		log.LogDNS(q.Domain, q.QType, res.Action)
 		emitEvent(socket.Event{
 			Type: "dns", Domain: q.Domain, QType: q.QType,
 			Action: res.Action, Tag: ruleTag, Learned: res.Learned,
@@ -325,7 +325,7 @@ func ChildSetup() (*ChildState, error) {
 		if res.Rule != nil && res.Rule.Tag != "" {
 			ruleTag = res.Rule.Tag
 		}
-		log.LogTCP(c.Dest, c.SNI)
+		log.LogTCP(c.Dest, c.SNI, res.Action)
 		emitEvent(socket.Event{
 			Type: "tcp", Dest: c.Dest, SNI: c.SNI, Domain: domain,
 			Action: res.Action, Tag: ruleTag, Learned: res.Learned,

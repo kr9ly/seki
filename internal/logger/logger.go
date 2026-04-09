@@ -20,12 +20,15 @@ CREATE TABLE IF NOT EXISTS log (
 	domain  TEXT,
 	dest    TEXT,
 	extra   TEXT,
-	session TEXT
+	session TEXT,
+	action  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_log_time    ON log(time);
 CREATE INDEX IF NOT EXISTS idx_log_domain  ON log(domain);
 CREATE INDEX IF NOT EXISTS idx_log_session ON log(session);
 `
+
+const migration = `ALTER TABLE log ADD COLUMN action TEXT;`
 
 // Logger writes connection events to a SQLite database.
 type Logger struct {
@@ -50,6 +53,8 @@ func Open() (*Logger, error) {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	// Migrate existing databases: add action column if missing
+	db.Exec(migration) // ignore error (column already exists)
 
 	return &Logger{db: db, session: newSessionID()}, nil
 }
@@ -74,18 +79,18 @@ func OpenReadOnly() (*Logger, error) {
 }
 
 // LogDNS records a DNS query.
-func (l *Logger) LogDNS(domain, qtype string) {
+func (l *Logger) LogDNS(domain, qtype, action string) {
 	l.db.Exec(
-		"INSERT INTO log (time, kind, domain, extra, session) VALUES (?, 'dns', ?, ?, ?)",
-		now(), domain, qtype, l.session,
+		"INSERT INTO log (time, kind, domain, extra, session, action) VALUES (?, 'dns', ?, ?, ?, ?)",
+		now(), domain, qtype, l.session, action,
 	)
 }
 
 // LogTCP records a TCP connection.
-func (l *Logger) LogTCP(dest, sni string) {
+func (l *Logger) LogTCP(dest, sni, action string) {
 	l.db.Exec(
-		"INSERT INTO log (time, kind, dest, domain, session) VALUES (?, 'tcp', ?, ?, ?)",
-		now(), dest, sni, l.session,
+		"INSERT INTO log (time, kind, dest, domain, session, action) VALUES (?, 'tcp', ?, ?, ?, ?)",
+		now(), dest, sni, l.session, action,
 	)
 }
 
@@ -97,6 +102,7 @@ type Entry struct {
 	Dest    string
 	Extra   string
 	Session string
+	Action  string
 }
 
 // Query returns log entries matching the given filters.
@@ -106,12 +112,12 @@ func (l *Logger) Query(domain string, limit int) ([]Entry, error) {
 
 	if domain != "" {
 		rows, err = l.db.Query(
-			"SELECT time, kind, domain, COALESCE(dest,''), COALESCE(extra,''), session FROM log WHERE domain LIKE ? ORDER BY time DESC LIMIT ?",
+			"SELECT time, kind, domain, COALESCE(dest,''), COALESCE(extra,''), session, COALESCE(action,'') FROM log WHERE domain LIKE ? ORDER BY time DESC LIMIT ?",
 			"%"+domain+"%", limit,
 		)
 	} else {
 		rows, err = l.db.Query(
-			"SELECT time, kind, domain, COALESCE(dest,''), COALESCE(extra,''), session FROM log ORDER BY time DESC LIMIT ?",
+			"SELECT time, kind, domain, COALESCE(dest,''), COALESCE(extra,''), session, COALESCE(action,'') FROM log ORDER BY time DESC LIMIT ?",
 			limit,
 		)
 	}
@@ -123,7 +129,7 @@ func (l *Logger) Query(domain string, limit int) ([]Entry, error) {
 	var entries []Entry
 	for rows.Next() {
 		var e Entry
-		if err := rows.Scan(&e.Time, &e.Kind, &e.Domain, &e.Dest, &e.Extra, &e.Session); err != nil {
+		if err := rows.Scan(&e.Time, &e.Kind, &e.Domain, &e.Dest, &e.Extra, &e.Session, &e.Action); err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)
@@ -140,7 +146,7 @@ func (l *Logger) Query(domain string, limit int) ([]Entry, error) {
 func (l *Logger) QuerySince(d time.Duration) ([]Entry, error) {
 	since := time.Now().Add(-d).UTC().Format(time.RFC3339)
 	rows, err := l.db.Query(
-		"SELECT time, kind, domain, COALESCE(dest,''), COALESCE(extra,''), session FROM log WHERE time >= ? ORDER BY time",
+		"SELECT time, kind, domain, COALESCE(dest,''), COALESCE(extra,''), session, COALESCE(action,'') FROM log WHERE time >= ? ORDER BY time",
 		since,
 	)
 	if err != nil {
@@ -151,7 +157,7 @@ func (l *Logger) QuerySince(d time.Duration) ([]Entry, error) {
 	var entries []Entry
 	for rows.Next() {
 		var e Entry
-		if err := rows.Scan(&e.Time, &e.Kind, &e.Domain, &e.Dest, &e.Extra, &e.Session); err != nil {
+		if err := rows.Scan(&e.Time, &e.Kind, &e.Domain, &e.Dest, &e.Extra, &e.Session, &e.Action); err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)
