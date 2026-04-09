@@ -456,10 +456,9 @@ mount 名前空間で `~/.config/seki/` を read-only bind mount する。
 
 ### 未実装
 
-- [ ] `seki query` — PostToolUse hook 連携
-- [ ] `seki mode` — learning/enforce 切替コマンド
-- [ ] コマンド承認レイヤー (hooks 連携、手続き単位の承認)
-- [ ] watch TUI の対話操作 (承認、ルール追加)
+- [ ] PostToolUse hook 設定 (`seki query --since=5s --format=hook`)
+- [ ] PreToolUse hook 設定 (`seki check` 連携)
+- [ ] watch TUI の対話操作 (ルール追加)
 - [ ] ECH 除去 (HTTPS/SVCB レコードから ECH 設定を除去)
 - [ ] メタデータ read-only bind mount
 - [ ] 起動時パーミッションチェック
