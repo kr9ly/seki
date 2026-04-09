@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 )
@@ -50,11 +48,7 @@ func NewServer() (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen %s: %w", path, err)
 	}
-	// Make socket accessible to the real user
 	os.Chmod(path, 0660)
-	if uid, gid := sudoIDs(); uid >= 0 {
-		os.Chown(path, uid, gid)
-	}
 
 	s := &Server{path: path, ln: ln}
 	go s.accept()
@@ -150,46 +144,28 @@ func (c *Client) Event() (Event, error) {
 	return e, nil
 }
 
+// Emit sends an event to the server (used by child process to emit events).
+func (c *Client) Emit(e Event) error {
+	data, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	_, err = c.conn.Write(data)
+	return err
+}
+
 // Close closes the client connection.
 func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
 func sockPath() (string, error) {
-	home, err := realUserHome()
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
 	dir := filepath.Join(home, ".config", "seki")
 	os.MkdirAll(dir, 0700)
 	return filepath.Join(dir, "seki.sock"), nil
-}
-
-func sudoIDs() (int, int) {
-	uidStr := os.Getenv("SUDO_UID")
-	gidStr := os.Getenv("SUDO_GID")
-	if uidStr == "" {
-		return -1, -1
-	}
-	var uid, gid int
-	fmt.Sscanf(uidStr, "%d", &uid)
-	fmt.Sscanf(gidStr, "%d", &gid)
-	return uid, gid
-}
-
-func realUserHome() (string, error) {
-	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-		home := os.Getenv("SUDO_HOME")
-		if home != "" {
-			return home, nil
-		}
-		out, err := exec.Command("getent", "passwd", sudoUser).Output()
-		if err == nil {
-			fields := strings.SplitN(string(out), ":", 7)
-			if len(fields) >= 6 {
-				return fields[5], nil
-			}
-		}
-	}
-	return os.UserHomeDir()
 }

@@ -71,14 +71,14 @@ func cmdChild() {
 		os.Exit(1)
 	}
 
-	// ChildSetup returns the redirect proxy which must stay alive
-	// while the user command runs (so we can't syscall.Exec).
-	rp, err := netns.ChildSetup()
+	// ChildSetup starts DNS resolver, TCP proxy, and configures iptables.
+	// These must stay alive while the user command runs.
+	state, err := netns.ChildSetup()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "seki: namespace setup failed: %v\n", err)
 		os.Exit(1)
 	}
-	defer rp.Close()
+	defer state.Close()
 
 	// Run user command as subprocess
 	cmd := exec.Command(args[0], args[1:]...)
@@ -91,7 +91,7 @@ func cmdChild() {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
-		fmt.Fprintf(os.Stderr, "seki: %v\n", err)
+		fmt.Fprintf(os.Stderr, "seki: exec %v: %v\n", args[0], err)
 		os.Exit(1)
 	}
 }

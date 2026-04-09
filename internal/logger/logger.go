@@ -6,9 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -172,7 +170,7 @@ func (l *Logger) SessionID() string {
 }
 
 func dbPath() (string, error) {
-	home, err := realUserHome()
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home: %w", err)
 	}
@@ -180,42 +178,7 @@ func dbPath() (string, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("create config dir: %w", err)
 	}
-	// If running as root via sudo, fix ownership to the real user
-	if sudoUID := os.Getenv("SUDO_UID"); sudoUID != "" {
-		var uid, gid int
-		fmt.Sscanf(sudoUID, "%d", &uid)
-		fmt.Sscanf(os.Getenv("SUDO_GID"), "%d", &gid)
-		os.Chown(dir, uid, gid)
-	}
-	dbFile := filepath.Join(dir, "seki.db")
-	// Fix ownership of the DB file if it was just created by root
-	if sudoUID := os.Getenv("SUDO_UID"); sudoUID != "" {
-		var uid, gid int
-		fmt.Sscanf(sudoUID, "%d", &uid)
-		fmt.Sscanf(os.Getenv("SUDO_GID"), "%d", &gid)
-		os.Chown(dbFile, uid, gid)
-	}
-	return dbFile, nil
-}
-
-// realUserHome returns the home directory of the real user (not root when using sudo).
-func realUserHome() (string, error) {
-	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-		// Running as root via sudo — use the original user's home
-		home := os.Getenv("SUDO_HOME")
-		if home != "" {
-			return home, nil
-		}
-		// SUDO_HOME not always set; look up from passwd
-		out, err := exec.Command("getent", "passwd", sudoUser).Output()
-		if err == nil {
-			fields := strings.SplitN(string(out), ":", 7)
-			if len(fields) >= 6 {
-				return fields[5], nil
-			}
-		}
-	}
-	return os.UserHomeDir()
+	return filepath.Join(dir, "seki.db"), nil
 }
 
 func newSessionID() string {

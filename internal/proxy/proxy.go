@@ -1,12 +1,10 @@
 package proxy
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net"
-	"os"
-	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kr9ly/seki/internal/sni"
@@ -20,18 +18,20 @@ type ConnEntry struct {
 }
 
 // OnConnectFunc is called for each proxied TCP connection.
-type OnConnectFunc func(ConnEntry)
+// Returns true to allow the connection, false to drop it.
+type OnConnectFunc func(ConnEntry) bool
 
-// Proxy is the host-side TCP proxy that receives forwarded connections
-// from the child-side redirect proxy and connects to the actual destination.
+// Proxy intercepts redirected TCP connections inside the network namespace.
+// It uses SO_ORIGINAL_DST to recover the real destination and SO_MARK
+// to bypass iptables REDIRECT on its own outgoing connections.
 type Proxy struct {
 	listenAddr string
 	onConnect  OnConnectFunc
 	ln         net.Listener
 }
 
-// NewProxy creates a host-side TCP proxy.
-// listenAddr: address to listen on (e.g., "10.200.1.1:10201")
+// NewProxy creates a TCP proxy.
+// listenAddr: address to listen on (e.g., "127.0.0.1:10200")
 func NewProxy(listenAddr string, onConnect OnConnectFunc) *Proxy {
 	return &Proxy{
 		listenAddr: listenAddr,
@@ -54,7 +54,7 @@ func (p *Proxy) Start() error {
 			if err != nil {
 				return
 			}
-			go p.handle(conn)
+			go p.handle(conn.(*net.TCPConn))
 		}
 	}()
 
@@ -69,48 +69,64 @@ func (p *Proxy) Close() error {
 	return nil
 }
 
-func (p *Proxy) handle(client net.Conn) {
+// markDialer creates outgoing connections with SO_MARK=1
+// to bypass iptables REDIRECT rules.
+var markDialer = &net.Dialer{
+	Timeout: 10 * time.Second,
+	Control: func(network, address string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 0x24, 1) // SO_MARK = 36
+		})
+	},
+}
+
+func (p *Proxy) handle(client *net.TCPConn) {
 	defer client.Close()
 
-	reader := bufio.NewReader(client)
-
-	// Read destination header from child-side redirect proxy
-	destLine, err := reader.ReadString('\n')
+	// Recover the original destination from iptables REDIRECT
+	origDst, err := getOriginalDst(client)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[seki] proxy: failed to read dest header: %v\n", err)
 		return
 	}
-	dest := strings.TrimSpace(destLine)
+	dest := origDst.String()
 
-	// Connect to the original destination
-	remote, err := net.DialTimeout("tcp", dest, 10*time.Second)
+	// Connect to the real destination with SO_MARK to bypass iptables
+	remote, err := markDialer.Dial("tcp", dest)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[seki] proxy: connect %s: %v\n", dest, err)
 		return
 	}
 	defer remote.Close()
 
 	entry := ConnEntry{Time: time.Now(), Dest: dest}
 
-	// Read first data chunk from client for SNI extraction
-	// The bufio reader may have buffered data from the header read
-	firstChunk, err := p.readFirst(reader)
-	if err == nil && len(firstChunk) > 0 {
-		if domain := sni.Extract(firstChunk); domain != "" {
+	// Peek first bytes for SNI extraction
+	buf := make([]byte, 4096)
+	client.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	n, _ := client.Read(buf)
+	client.SetReadDeadline(time.Time{})
+
+	if n > 0 {
+		if domain := sni.Extract(buf[:n]); domain != "" {
 			entry.SNI = domain
 		}
-		// Forward the first chunk to remote
-		remote.Write(firstChunk)
 	}
 
+	// Evaluate rules — drop connection if denied
 	if p.onConnect != nil {
-		p.onConnect(entry)
+		if !p.onConnect(entry) {
+			return
+		}
 	}
 
-	// Bidirectional relay for the rest
+	// Forward first chunk and relay
+	if n > 0 {
+		remote.Write(buf[:n])
+	}
+
+	// Bidirectional relay
 	done := make(chan struct{})
 	go func() {
-		io.Copy(remote, reader) // drains bufio buffer, then reads from client
+		io.Copy(remote, client)
 		if tc, ok := remote.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -118,20 +134,4 @@ func (p *Proxy) handle(client net.Conn) {
 	}()
 	io.Copy(client, remote)
 	<-done
-}
-
-// readFirst reads the first chunk of data, waiting briefly if needed.
-func (p *Proxy) readFirst(reader *bufio.Reader) ([]byte, error) {
-	// Check if bufio already has data buffered
-	if reader.Buffered() > 0 {
-		return reader.Peek(reader.Buffered())
-	}
-
-	// Wait briefly for the first data (TLS ClientHello)
-	buf := make([]byte, 4096)
-	n, err := reader.Read(buf)
-	if n > 0 {
-		return buf[:n], nil
-	}
-	return nil, err
 }

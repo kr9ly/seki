@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -180,7 +179,7 @@ func matchGlob(pattern, domain string) bool {
 }
 
 func rulesPath() (string, error) {
-	home, err := realUserHome()
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
@@ -189,21 +188,4 @@ func rulesPath() (string, error) {
 		return "", fmt.Errorf("create config dir: %w", err)
 	}
 	return filepath.Join(dir, "rules.json"), nil
-}
-
-func realUserHome() (string, error) {
-	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-		home := os.Getenv("SUDO_HOME")
-		if home != "" {
-			return home, nil
-		}
-		out, err := exec.Command("getent", "passwd", sudoUser).Output()
-		if err == nil {
-			fields := strings.SplitN(string(out), ":", 7)
-			if len(fields) >= 6 {
-				return fields[5], nil
-			}
-		}
-	}
-	return os.UserHomeDir()
 }

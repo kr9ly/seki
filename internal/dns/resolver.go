@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	mdns "github.com/miekg/dns"
@@ -19,7 +20,8 @@ type QueryEntry struct {
 }
 
 // OnQueryFunc is called for each DNS query received by the resolver.
-type OnQueryFunc func(QueryEntry)
+// Returns true to allow the query, false to return NXDOMAIN.
+type OnQueryFunc func(QueryEntry) bool
 
 // Resolver is a forwarding DNS server that logs all queries.
 type Resolver struct {
@@ -97,15 +99,26 @@ func (r *Resolver) Close() error {
 }
 
 func (r *Resolver) handle(w mdns.ResponseWriter, req *mdns.Msg) {
-	// Log each question
+	// Evaluate each question — deny if any question is denied
+	denied := false
 	for _, q := range req.Question {
 		if r.onQuery != nil {
-			r.onQuery(QueryEntry{
+			if !r.onQuery(QueryEntry{
 				Time:   time.Now(),
 				Domain: strings.TrimSuffix(q.Name, "."),
 				QType:  mdns.TypeToString[q.Qtype],
-			})
+			}) {
+				denied = true
+			}
 		}
+	}
+
+	// Return NXDOMAIN for denied queries
+	if denied {
+		msg := new(mdns.Msg)
+		msg.SetRcode(req, mdns.RcodeNameError)
+		w.WriteMsg(msg)
+		return
 	}
 
 	// Forward to upstream
@@ -114,7 +127,13 @@ func (r *Resolver) handle(w mdns.ResponseWriter, req *mdns.Msg) {
 		proto = "tcp"
 	}
 
-	client := &mdns.Client{Net: proto, Timeout: 5 * time.Second}
+	client := &mdns.Client{
+		Net:     proto,
+		Timeout: 5 * time.Second,
+		Dialer: &net.Dialer{
+			Control: setSOMarkControl,
+		},
+	}
 	resp, _, err := client.Exchange(req, r.upstream)
 	if err != nil {
 		msg := new(mdns.Msg)
@@ -144,4 +163,11 @@ func DetectUpstream() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no nameserver found in /etc/resolv.conf")
+}
+
+// setSOMarkControl sets SO_MARK=1 on a socket to bypass iptables REDIRECT rules.
+func setSOMarkControl(network, address string, c syscall.RawConn) error {
+	return c.Control(func(fd uintptr) {
+		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 0x24, 1) // SO_MARK = 0x24 (36)
+	})
 }
