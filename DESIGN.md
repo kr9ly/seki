@@ -90,6 +90,53 @@ seki exec 起動時:
      → 子プロセスから ~/.config/seki/ は読めるが書けない
 ```
 
+## ホスト安全性保証
+
+seki が crash・SIGKILL されてもホスト環境を破壊しないことを構造的に保証する。
+
+### 原則: ホスト側の変更を veth pair のみに限定する
+
+veth pair はネットワーク名前空間の消滅時に自動削除される。
+それ以外のホスト側状態（iptables, sysctl, resolv.conf）は **一切変更しない**。
+
+| リソース | 場所 | crash 時 |
+|----------|------|----------|
+| veth pair | ホスト | namespace 消滅で自動削除 |
+| iptables REDIRECT | 子の名前空間内 | namespace 消滅で自動削除 |
+| DNS リゾルバ | seki プロセス | プロセス死で自動消滅 |
+| TCP プロキシ | seki プロセス | プロセス死で自動消滅 |
+
+### やらないこと
+
+- **ホスト側の iptables を触らない**: NAT (MASQUERADE) は使わない。
+  TCP プロキシで代替する。既存の iptables チェーン（Tailscale 等）と干渉しない。
+- **sysctl を変更しない**: `ip_forward` 等のカーネルパラメータは変更不要。
+  NAT を使わず TCP プロキシで中継するため。
+- **ホストの /etc/resolv.conf を触らない**: 子の名前空間内で
+  `iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to 10.200.1.1:53`
+  により DNS を seki にリダイレクトする。bind mount は使わない。
+
+### 子プロセス側のネットワーク構成
+
+子の名前空間内でのみ iptables を使用する（ホストに影響しない）。
+
+```
+# DNS: 全ての DNS クエリを seki のリゾルバにリダイレクト
+iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination 10.200.1.1:53
+iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination 10.200.1.1:53
+
+# TCP: 全ての TCP 接続を seki のプロキシにリダイレクト
+iptables -t nat -A OUTPUT -p tcp -j DNAT --to-destination 10.200.1.1:<proxy-port>
+
+# UDP: DNS 以外の UDP をブロック（QUIC/HTTP3 による検問迂回を防止）
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A OUTPUT -p udp -d 10.200.1.0/24 -j ACCEPT
+iptables -A OUTPUT -p udp -j DROP
+```
+
+seki の TCP プロキシは元の宛先 IP:port を `SO_ORIGINAL_DST` で取得し、
+実際の接続先に中継する。
+
 ## アーキテクチャ
 
 ```
@@ -116,6 +163,9 @@ seki exec 起動時:
 - `unshare --net --mount` + ユーザー名前空間で子プロセスを隔離
 - mount 名前空間で `~/.config/seki/` を read-only bind mount（メタデータ保護）
 - veth pair でホスト側の seki プロセスにのみ接続可能にする
+- **ホスト側の状態変更は veth pair のみ** — iptables, sysctl, resolv.conf は触らない
+  （詳細は「ホスト安全性保証」セクションを参照）
+- 子の名前空間内で iptables REDIRECT → seki の DNS リゾルバ + TCP プロキシへ
 - TLS を終端 **しない** — Certificate Pinning を使うツールを壊さない
 
 ### 3層の検問
@@ -399,10 +449,11 @@ seki/
 ### Phase 1: 観察できる状態にする
 
 1. `unshare --net --mount` + veth pair で子プロセスを隔離 (WSL2 動作確認含む)
-2. DNS リゾルバ — 名前空間内の DNS を掌握し、全クエリをログに記録
-3. TCP プロキシ — 全接続を中継し、SNI からドメインを抽出して DNS ログと照合
-4. `seki exec --learning -- <command>` で任意のコマンドを監視下で実行
-5. `seki log` でログを確認
+2. DNS リゾルバ — 10.200.1.1:53 で listen、全クエリをログに記録し上流に転送
+3. TCP プロキシ — 10.200.1.1 で listen、`SO_ORIGINAL_DST` で元の宛先を取得して中継。SNI を抽出してログに記録
+4. 子の名前空間内で iptables REDIRECT — DNS (udp/tcp 53) と全 TCP を seki にリダイレクト。ホスト側の iptables/sysctl は一切触らない
+5. `seki exec --learning -- <command>` で任意のコマンドを監視下で実行
+6. `seki log` でログを確認
 
 ### Phase 2: ルールとレビュー
 
@@ -433,6 +484,10 @@ seki/
 - [x] watch 未起動時: 承認リクエストはタイムアウトで deny（安全側に倒す）
 - [x] メタデータ保護: mount 名前空間で `~/.config/seki/` を read-only bind mount
 - [x] 起動時パーミッションチェック: git 方式でオーナー・権限を検証、不合格なら起動拒否
+- [x] ホスト安全性: ホスト側の変更は veth pair のみ。iptables/sysctl/resolv.conf は触らない
+- [x] NAT 不使用: iptables MASQUERADE の代わりに TCP プロキシで中継（ホスト iptables との干渉を排除）
+- [x] DNS リダイレクト: resolv.conf bind mount ではなく、子の名前空間内の iptables DNAT で強制
+- [x] UDP ブロック: DNS 以外の UDP は DROP（QUIC/HTTP3 による TCP プロキシ迂回を防止、TCP フォールバックで SNI 捕捉可能に）
 
 ### 未決
 
