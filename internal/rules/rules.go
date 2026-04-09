@@ -11,8 +11,9 @@ import (
 
 // Action constants.
 const (
-	Allow = "allow"
-	Deny  = "deny"
+	Allow  = "allow"
+	Deny   = "deny"
+	Prompt = "prompt"
 )
 
 // Rule defines a single matching rule.
@@ -78,9 +79,9 @@ func (rs *RuleSet) Evaluate(domain, ip string) Result {
 		r := &rs.Rules[i]
 		if matchRule(r.Match, domain, ip) {
 			res := Result{Action: r.Action, Rule: r}
-			if r.Action == Deny && rs.LearningMode {
+			if (r.Action == Deny || r.Action == Prompt) && rs.LearningMode {
 				res.Learned = true
-				res.Action = Allow // don't actually block in learning mode
+				res.Action = Allow
 			}
 			return res
 		}

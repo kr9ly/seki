@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/kr9ly/seki/internal/approval"
 	sekidns "github.com/kr9ly/seki/internal/dns"
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/proxy"
@@ -147,6 +149,11 @@ func Exec(args []string) (*Sandbox, error) {
 	}
 	sb.cleanup = append(sb.cleanup, func() { sock.Close() })
 
+	// Re-broadcast messages from watch to all clients (including child)
+	sock.OnMessage(func(e socket.Event) {
+		sock.Emit(e)
+	})
+
 	// Signal child: slirp4netns is ready, proceed with setup
 	syncPw.Write([]byte{1})
 	syncPw.Close()
@@ -182,7 +189,10 @@ type ChildState struct {
 	resolver *sekidns.Resolver
 	proxy    *proxy.Proxy
 	sock     *socket.Client
+	Queue    *approval.Queue
 }
+
+const approvalTimeout = 30 * time.Second
 
 // Close tears down child resources.
 func (cs *ChildState) Close() {
@@ -237,7 +247,7 @@ func ChildSetup() (*ChildState, error) {
 		return nil, fmt.Errorf("load rules: %w", err)
 	}
 
-	// Connect to watch socket (best-effort — watch might not be running)
+	// Connect to parent's socket server for event exchange
 	sock, err := socket.Connect(false)
 	if err != nil {
 		sock = nil
@@ -248,6 +258,28 @@ func ChildSetup() (*ChildState, error) {
 		if cs.sock != nil {
 			cs.sock.Emit(e)
 		}
+	}
+
+	// Listen for approve/deny messages from watch (via parent re-broadcast)
+	if sock != nil {
+		go func() {
+			for sock.Next() {
+				e, err := sock.Event()
+				if err != nil {
+					continue
+				}
+				switch e.Type {
+				case "approve":
+					if cs.Queue != nil {
+						cs.Queue.Resolve(e.Domain, true)
+					}
+				case "deny":
+					if cs.Queue != nil {
+						cs.Queue.Resolve(e.Domain, false)
+					}
+				}
+			}
+		}()
 	}
 
 	// Emit status
@@ -269,7 +301,7 @@ func ChildSetup() (*ChildState, error) {
 			Type: "dns", Domain: q.Domain, QType: q.QType,
 			Action: res.Action, Tag: ruleTag, Learned: res.Learned,
 		})
-		return res.Action == rules.Allow
+		return res.Action == rules.Allow || res.Action == rules.Prompt
 	})
 	if err := resolver.Start(); err != nil {
 		cs.Close()
@@ -277,8 +309,12 @@ func ChildSetup() (*ChildState, error) {
 	}
 	cs.resolver = resolver
 
+	// Approval queue for prompt action
+	queue := approval.NewQueue()
+	cs.Queue = queue
+
 	// Start TCP proxy
-	tcpProxy := proxy.NewProxy("127.0.0.1:"+ProxyPort, func(c proxy.ConnEntry) bool {
+	tcpProxy := proxy.NewProxy("127.0.0.1:"+ProxyPort, func(c proxy.ConnEntry) proxy.ConnResult {
 		domain := c.SNI
 		ip := ""
 		if host, _, err := net.SplitHostPort(c.Dest); err == nil {
@@ -294,7 +330,27 @@ func ChildSetup() (*ChildState, error) {
 			Type: "tcp", Dest: c.Dest, SNI: c.SNI, Domain: domain,
 			Action: res.Action, Tag: ruleTag, Learned: res.Learned,
 		})
-		return res.Action == rules.Allow
+
+		switch res.Action {
+		case rules.Allow:
+			return proxy.ConnAllow
+		case rules.Prompt:
+			// Block and wait for approval
+			queueDomain := domain
+			if queueDomain == "" {
+				queueDomain = c.Dest
+			}
+			emitEvent(socket.Event{
+				Type: "approval", Domain: queueDomain, Dest: c.Dest,
+				Action: "prompt", QueueSize: queue.Size() + 1,
+			})
+			if queue.Submit(queueDomain, c.Dest, approvalTimeout) {
+				return proxy.ConnAllow
+			}
+			return proxy.ConnDeny
+		default: // deny
+			return proxy.ConnDeny
+		}
 	})
 	if err := tcpProxy.Start(); err != nil {
 		cs.Close()

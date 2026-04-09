@@ -11,28 +11,35 @@ import (
 	"time"
 )
 
-// Event is a real-time notification from seki exec to seki watch.
+// Event is a real-time notification exchanged between seki components.
 type Event struct {
-	Type    string `json:"type"`              // "dns", "tcp", "status"
+	Type    string `json:"type"`              // "dns", "tcp", "status", "approval", "approve", "deny"
 	Time    string `json:"time,omitempty"`
 	Domain  string `json:"domain,omitempty"`
 	QType   string `json:"qtype,omitempty"`
 	Dest    string `json:"dest,omitempty"`
 	SNI     string `json:"sni,omitempty"`
-	Action  string `json:"action,omitempty"`  // "allow", "deny"
+	Action  string `json:"action,omitempty"`  // "allow", "deny", "prompt"
 	Tag     string `json:"tag,omitempty"`
 	Learned bool   `json:"learned,omitempty"` // would deny in learning mode
 	// Status event fields
 	Session      string `json:"session,omitempty"`
 	LearningMode bool   `json:"learning_mode,omitempty"`
+	// Approval queue fields
+	QueueSize int `json:"queue_size,omitempty"`
 }
 
+// MessageFunc is called when a message is received from a watch client.
+type MessageFunc func(Event)
+
 // Server streams events to connected watch clients via a Unix socket.
+// It also reads messages from clients (bidirectional).
 type Server struct {
-	path    string
-	ln      net.Listener
-	clients []net.Conn
-	mu      sync.Mutex
+	path      string
+	ln        net.Listener
+	clients   []net.Conn
+	mu        sync.Mutex
+	onMessage MessageFunc
 }
 
 // NewServer creates a socket server at ~/.config/seki/seki.sock.
@@ -53,6 +60,13 @@ func NewServer() (*Server, error) {
 	s := &Server{path: path, ln: ln}
 	go s.accept()
 	return s, nil
+}
+
+// OnMessage sets the callback for messages received from watch clients.
+func (s *Server) OnMessage(fn MessageFunc) {
+	s.mu.Lock()
+	s.onMessage = fn
+	s.mu.Unlock()
 }
 
 // Emit broadcasts an event to all connected watch clients.
@@ -100,7 +114,35 @@ func (s *Server) accept() {
 		s.mu.Lock()
 		s.clients = append(s.clients, conn)
 		s.mu.Unlock()
+
+		// Read messages from this client
+		go s.readFrom(conn)
 	}
+}
+
+func (s *Server) readFrom(conn net.Conn) {
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		var e Event
+		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
+			continue
+		}
+		s.mu.Lock()
+		fn := s.onMessage
+		s.mu.Unlock()
+		if fn != nil {
+			fn(e)
+		}
+	}
+	// Client disconnected — remove from clients list
+	s.mu.Lock()
+	for i, c := range s.clients {
+		if c == conn {
+			s.clients = append(s.clients[:i], s.clients[i+1:]...)
+			break
+		}
+	}
+	s.mu.Unlock()
 }
 
 // Client connects to the seki exec socket and receives events.
@@ -144,7 +186,7 @@ func (c *Client) Event() (Event, error) {
 	return e, nil
 }
 
-// Emit sends an event to the server (used by child process to emit events).
+// Emit sends an event to the server (used by watch to send approve/deny).
 func (c *Client) Emit(e Event) error {
 	data, err := json.Marshal(e)
 	if err != nil {

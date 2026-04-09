@@ -17,9 +17,18 @@ type ConnEntry struct {
 	SNI  string
 }
 
+// ConnResult is the action to take for a connection.
+type ConnResult int
+
+const (
+	ConnAllow  ConnResult = iota // proceed with connection
+	ConnDeny                     // drop immediately
+	ConnPrompt                   // block, wait for approval queue
+)
+
 // OnConnectFunc is called for each proxied TCP connection.
-// Returns true to allow the connection, false to drop it.
-type OnConnectFunc func(ConnEntry) bool
+// Returns the action to take.
+type OnConnectFunc func(ConnEntry) ConnResult
 
 // Proxy intercepts redirected TCP connections inside the network namespace.
 // It uses SO_ORIGINAL_DST to recover the real destination and SO_MARK
@@ -90,16 +99,10 @@ func (p *Proxy) handle(client *net.TCPConn) {
 	}
 	dest := origDst.String()
 
-	// Connect to the real destination with SO_MARK to bypass iptables
-	remote, err := markDialer.Dial("tcp", dest)
-	if err != nil {
-		return
-	}
-	defer remote.Close()
-
 	entry := ConnEntry{Time: time.Now(), Dest: dest}
 
-	// Peek first bytes for SNI extraction
+	// Peek first bytes for SNI extraction (before rule evaluation,
+	// so we can show domain name in approval queue)
 	buf := make([]byte, 4096)
 	client.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	n, _ := client.Read(buf)
@@ -111,12 +114,24 @@ func (p *Proxy) handle(client *net.TCPConn) {
 		}
 	}
 
-	// Evaluate rules — drop connection if denied
+	// Evaluate rules — may block on approval queue for prompt
 	if p.onConnect != nil {
-		if !p.onConnect(entry) {
+		switch p.onConnect(entry) {
+		case ConnDeny:
 			return
+		case ConnAllow:
+			// proceed
 		}
+		// ConnPrompt is handled inside onConnect (blocks until resolved)
+		// If it returns ConnDeny after prompt, we already returned above
 	}
+
+	// Connect to the real destination with SO_MARK to bypass iptables
+	remote, err := markDialer.Dial("tcp", dest)
+	if err != nil {
+		return
+	}
+	defer remote.Close()
 
 	// Forward first chunk and relay
 	if n > 0 {

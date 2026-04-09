@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/netns"
 	"github.com/kr9ly/seki/internal/rules"
 	"github.com/kr9ly/seki/internal/socket"
+	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -157,69 +159,191 @@ func cmdWatch() {
 	defer client.Close()
 
 	const (
-		reset  = "\033[0m"
-		green  = "\033[32m"
-		yellow = "\033[33m"
-		red    = "\033[31m"
-		dim    = "\033[2m"
-		bold   = "\033[1m"
+		reset   = "\033[0m"
+		green   = "\033[32m"
+		yellow  = "\033[33m"
+		red     = "\033[31m"
+		cyan    = "\033[36m"
+		dim     = "\033[2m"
+		bold    = "\033[1m"
+		inverse = "\033[7m"
 	)
 
-	fmt.Fprintln(os.Stderr, bold+"seki watch"+reset+" — connected, waiting for events...\n")
+	// Approval queue state (local mirror)
+	type queueItem struct {
+		domain string
+		dest   string
+	}
+	var queue []queueItem
+	var queueMu sync.Mutex
 
-	for client.Next() {
-		e, err := client.Event()
-		if err != nil {
-			continue
+	// Set terminal to raw mode for keyboard input
+	oldState, rawErr := enableRawMode()
+	if rawErr == nil {
+		defer restoreTerminal(oldState)
+	}
+
+	renderQueue := func() {
+		queueMu.Lock()
+		defer queueMu.Unlock()
+		if len(queue) == 0 {
+			return
 		}
-
-		switch e.Type {
-		case "status":
-			mode := "enforce"
-			if e.LearningMode {
-				mode = "learning"
+		fmt.Printf("\r%s── approval queue (%d) ──%s\n", dim, len(queue), reset)
+		for i, item := range queue {
+			prefix := "  "
+			if i == 0 {
+				prefix = inverse + "❯ " + reset
 			}
-			fmt.Printf("%ssession: %s  mode: %s%s\n", dim, e.Session, mode, reset)
-
-		case "dns":
-			color := green
-			suffix := ""
-			if e.Learned {
-				color = yellow
-				suffix = " — would deny"
-			} else if e.Action == "deny" {
-				color = red
-				suffix = " — DENIED"
+			label := item.domain
+			if item.dest != "" && item.dest != item.domain {
+				label = item.dest + " (" + item.domain + ")"
 			}
-			tag := ""
-			if e.Tag != "" {
-				tag = dim + " [" + e.Tag + "]" + reset
+			if i == 0 {
+				fmt.Printf("%s%s — %s[a]%sllow %s[d]%seny%s\n", prefix, label, bold, reset, bold, reset, reset)
+			} else {
+				fmt.Printf("%s%s\n", prefix, label)
 			}
-			fmt.Printf("%sdns%s  %s (%s)%s%s\n", color, reset, e.Domain, e.QType, suffix, tag)
-
-		case "tcp":
-			color := green
-			suffix := ""
-			if e.Learned {
-				color = yellow
-				suffix = " — would deny"
-			} else if e.Action == "deny" {
-				color = red
-				suffix = " — DENIED"
-			}
-			label := e.Dest
-			if e.SNI != "" {
-				label = e.Dest + " (" + e.SNI + ")"
-			}
-			tag := ""
-			if e.Tag != "" {
-				tag = dim + " [" + e.Tag + "]" + reset
-			}
-			fmt.Printf("%stcp%s  %s%s%s\n", color, reset, label, suffix, tag)
 		}
 	}
 
-	fmt.Fprintln(os.Stderr, "\nseki exec disconnected.")
+	// Read events in background
+	events := make(chan socket.Event, 100)
+	go func() {
+		for client.Next() {
+			e, err := client.Event()
+			if err != nil {
+				continue
+			}
+			events <- e
+		}
+		close(events)
+	}()
+
+	// Read keyboard in background
+	keys := make(chan byte, 10)
+	if rawErr == nil {
+		go func() {
+			buf := make([]byte, 1)
+			for {
+				n, err := os.Stdin.Read(buf)
+				if err != nil || n == 0 {
+					return
+				}
+				keys <- buf[0]
+			}
+		}()
+	}
+
+	fmt.Printf("%sseki watch%s — connected, waiting for events...\n\n", bold, reset)
+
+	for {
+		select {
+		case e, ok := <-events:
+			if !ok {
+				fmt.Printf("\n%sseki exec disconnected.%s\n", dim, reset)
+				return
+			}
+
+			switch e.Type {
+			case "status":
+				mode := "enforce"
+				if e.LearningMode {
+					mode = "learning"
+				}
+				fmt.Printf("%ssession: %s  mode: %s%s\n", dim, e.Session, mode, reset)
+
+			case "dns":
+				color := green
+				suffix := ""
+				if e.Learned {
+					color = yellow
+					suffix = " — would deny"
+				} else if e.Action == "deny" {
+					color = red
+					suffix = " — DENIED"
+				}
+				tag := ""
+				if e.Tag != "" {
+					tag = dim + " [" + e.Tag + "]" + reset
+				}
+				fmt.Printf("%sdns%s  %s (%s)%s%s\n", color, reset, e.Domain, e.QType, suffix, tag)
+
+			case "tcp":
+				color := green
+				suffix := ""
+				if e.Learned {
+					color = yellow
+					suffix = " — would deny"
+				} else if e.Action == "deny" {
+					color = red
+					suffix = " — DENIED"
+				} else if e.Action == "prompt" {
+					color = cyan
+					suffix = " — ⏳ pending"
+				}
+				label := e.Dest
+				if e.SNI != "" {
+					label = e.Dest + " (" + e.SNI + ")"
+				}
+				tag := ""
+				if e.Tag != "" {
+					tag = dim + " [" + e.Tag + "]" + reset
+				}
+				fmt.Printf("%stcp%s  %s%s%s\n", color, reset, label, suffix, tag)
+
+			case "approval":
+				queueMu.Lock()
+				queue = append(queue, queueItem{domain: e.Domain, dest: e.Dest})
+				queueMu.Unlock()
+				renderQueue()
+
+			case "approve":
+				queueMu.Lock()
+				for i, item := range queue {
+					if item.domain == e.Domain {
+						queue = append(queue[:i], queue[i+1:]...)
+						break
+					}
+				}
+				queueMu.Unlock()
+				fmt.Printf("%s✓ approved: %s%s\n", green, e.Domain, reset)
+				renderQueue()
+
+			case "deny":
+				queueMu.Lock()
+				for i, item := range queue {
+					if item.domain == e.Domain {
+						queue = append(queue[:i], queue[i+1:]...)
+						break
+					}
+				}
+				queueMu.Unlock()
+				fmt.Printf("%s✗ denied: %s%s\n", red, e.Domain, reset)
+				renderQueue()
+			}
+
+		case key := <-keys:
+			queueMu.Lock()
+			hasItems := len(queue) > 0
+			var domain string
+			if hasItems {
+				domain = queue[0].domain
+			}
+			queueMu.Unlock()
+
+			if !hasItems {
+				continue
+			}
+
+			switch key {
+			case 'a', 'A':
+				client.Emit(socket.Event{Type: "approve", Domain: domain})
+			case 'd', 'D':
+				client.Emit(socket.Event{Type: "deny", Domain: domain})
+			}
+		}
+	}
 }
 
 func cmdRules() {
@@ -252,7 +376,7 @@ func cmdRules() {
 	case "add":
 		// seki rules add "*.github.com" --allow --tag git
 		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "usage: seki rules add <match> --allow|--deny [--tag <tag>]")
+			fmt.Fprintln(os.Stderr, "usage: seki rules add <match> --allow|--deny|--prompt [--tag <tag>]")
 			os.Exit(1)
 		}
 		match := os.Args[3]
@@ -264,6 +388,8 @@ func cmdRules() {
 				action = rules.Allow
 			case "--deny":
 				action = rules.Deny
+			case "--prompt":
+				action = rules.Prompt
 			case "--tag":
 				if i+1 < len(os.Args) {
 					tag = os.Args[i+1]
@@ -309,4 +435,26 @@ func argsAfterSep(args []string) []string {
 		}
 	}
 	return args
+}
+
+// enableRawMode puts the terminal into raw mode for single-character input.
+func enableRawMode() (*unix.Termios, error) {
+	fd := int(os.Stdin.Fd())
+	oldState, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		return nil, err
+	}
+	newState := *oldState
+	newState.Lflag &^= unix.ICANON | unix.ECHO
+	newState.Cc[unix.VMIN] = 1
+	newState.Cc[unix.VTIME] = 0
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &newState); err != nil {
+		return nil, err
+	}
+	return oldState, nil
+}
+
+// restoreTerminal restores the terminal to its previous state.
+func restoreTerminal(state *unix.Termios) {
+	unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TCSETS, state)
 }
