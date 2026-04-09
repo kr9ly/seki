@@ -8,6 +8,7 @@ import (
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/netns"
 	"github.com/kr9ly/seki/internal/rules"
+	"github.com/kr9ly/seki/internal/socket"
 )
 
 func main() {
@@ -30,8 +31,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "seki query: not yet implemented")
 		os.Exit(1)
 	case "watch":
-		fmt.Fprintln(os.Stderr, "seki watch: not yet implemented")
-		os.Exit(1)
+		cmdWatch()
 	case "mode":
 		fmt.Fprintln(os.Stderr, "seki mode: not yet implemented")
 		os.Exit(1)
@@ -146,6 +146,80 @@ func cmdLog() {
 			}
 		}
 	}
+}
+
+func cmdWatch() {
+	client, err := socket.Connect(true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki watch: %v\n", err)
+		os.Exit(1)
+	}
+	defer client.Close()
+
+	const (
+		reset  = "\033[0m"
+		green  = "\033[32m"
+		yellow = "\033[33m"
+		red    = "\033[31m"
+		dim    = "\033[2m"
+		bold   = "\033[1m"
+	)
+
+	fmt.Fprintln(os.Stderr, bold+"seki watch"+reset+" — connected, waiting for events...\n")
+
+	for client.Next() {
+		e, err := client.Event()
+		if err != nil {
+			continue
+		}
+
+		switch e.Type {
+		case "status":
+			mode := "enforce"
+			if e.LearningMode {
+				mode = "learning"
+			}
+			fmt.Printf("%ssession: %s  mode: %s%s\n", dim, e.Session, mode, reset)
+
+		case "dns":
+			color := green
+			suffix := ""
+			if e.Learned {
+				color = yellow
+				suffix = " — would deny"
+			} else if e.Action == "deny" {
+				color = red
+				suffix = " — DENIED"
+			}
+			tag := ""
+			if e.Tag != "" {
+				tag = dim + " [" + e.Tag + "]" + reset
+			}
+			fmt.Printf("%sdns%s  %s (%s)%s%s\n", color, reset, e.Domain, e.QType, suffix, tag)
+
+		case "tcp":
+			color := green
+			suffix := ""
+			if e.Learned {
+				color = yellow
+				suffix = " — would deny"
+			} else if e.Action == "deny" {
+				color = red
+				suffix = " — DENIED"
+			}
+			label := e.Dest
+			if e.SNI != "" {
+				label = e.Dest + " (" + e.SNI + ")"
+			}
+			tag := ""
+			if e.Tag != "" {
+				tag = dim + " [" + e.Tag + "]" + reset
+			}
+			fmt.Printf("%stcp%s  %s%s%s\n", color, reset, label, suffix, tag)
+		}
+	}
+
+	fmt.Fprintln(os.Stderr, "\nseki exec disconnected.")
 }
 
 func cmdRules() {

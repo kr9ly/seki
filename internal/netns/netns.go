@@ -13,6 +13,7 @@ import (
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/proxy"
 	"github.com/kr9ly/seki/internal/rules"
+	"github.com/kr9ly/seki/internal/socket"
 )
 
 const (
@@ -88,6 +89,15 @@ func Exec(args []string) (*Sandbox, error) {
 	sb.cleanup = append(sb.cleanup, func() { log.Close() })
 	fmt.Fprintf(os.Stderr, "[seki] session: %s\n", log.SessionID())
 
+	// Start Unix socket server for watch clients
+	sock, err := socket.NewServer()
+	if err != nil {
+		cmd.Process.Kill()
+		sb.Close()
+		return nil, fmt.Errorf("start socket server: %w", err)
+	}
+	sb.cleanup = append(sb.cleanup, func() { sock.Close() })
+
 	// Load rules
 	ruleset, err := rules.Load()
 	if err != nil {
@@ -101,6 +111,13 @@ func Exec(args []string) (*Sandbox, error) {
 		fmt.Fprintf(os.Stderr, "[seki] mode: enforce\n")
 	}
 
+	// Emit status to watch clients
+	sock.Emit(socket.Event{
+		Type:         "status",
+		Session:      log.SessionID(),
+		LearningMode: ruleset.LearningMode,
+	})
+
 	// Detect upstream DNS
 	upstream, err := sekidns.DetectUpstream()
 	if err != nil {
@@ -112,18 +129,26 @@ func Exec(args []string) (*Sandbox, error) {
 	// Start DNS resolver on the gateway address
 	resolver := sekidns.NewResolver(GatewayIP+":53", upstream, func(q sekidns.QueryEntry) {
 		res := ruleset.Evaluate(q.Domain, "")
-		tag := ""
+		ruleTag := ""
 		if res.Rule != nil && res.Rule.Tag != "" {
-			tag = " [" + res.Rule.Tag + "]"
+			ruleTag = res.Rule.Tag
+		}
+		tagSuffix := ""
+		if ruleTag != "" {
+			tagSuffix = " [" + ruleTag + "]"
 		}
 		if res.Learned {
-			fmt.Fprintf(os.Stderr, "[seki] dns: %s (%s) — would deny%s\n", q.Domain, q.QType, tag)
+			fmt.Fprintf(os.Stderr, "[seki] dns: %s (%s) — would deny%s\n", q.Domain, q.QType, tagSuffix)
 		} else if res.Action == rules.Deny {
-			fmt.Fprintf(os.Stderr, "[seki] dns: %s (%s) — DENIED%s\n", q.Domain, q.QType, tag)
+			fmt.Fprintf(os.Stderr, "[seki] dns: %s (%s) — DENIED%s\n", q.Domain, q.QType, tagSuffix)
 		} else {
-			fmt.Fprintf(os.Stderr, "[seki] dns: %s (%s)%s\n", q.Domain, q.QType, tag)
+			fmt.Fprintf(os.Stderr, "[seki] dns: %s (%s)%s\n", q.Domain, q.QType, tagSuffix)
 		}
 		log.LogDNS(q.Domain, q.QType)
+		sock.Emit(socket.Event{
+			Type: "dns", Domain: q.Domain, QType: q.QType,
+			Action: res.Action, Tag: ruleTag, Learned: res.Learned,
+		})
 	})
 	if err := resolver.Start(); err != nil {
 		cmd.Process.Kill()
@@ -140,22 +165,30 @@ func Exec(args []string) (*Sandbox, error) {
 			ip = host
 		}
 		res := ruleset.Evaluate(domain, ip)
-		tag := ""
+		ruleTag := ""
 		if res.Rule != nil && res.Rule.Tag != "" {
-			tag = " [" + res.Rule.Tag + "]"
+			ruleTag = res.Rule.Tag
+		}
+		tagSuffix := ""
+		if ruleTag != "" {
+			tagSuffix = " [" + ruleTag + "]"
 		}
 		label := c.Dest
 		if c.SNI != "" {
 			label = c.Dest + " (" + c.SNI + ")"
 		}
 		if res.Learned {
-			fmt.Fprintf(os.Stderr, "[seki] tcp: %s — would deny%s\n", label, tag)
+			fmt.Fprintf(os.Stderr, "[seki] tcp: %s — would deny%s\n", label, tagSuffix)
 		} else if res.Action == rules.Deny {
-			fmt.Fprintf(os.Stderr, "[seki] tcp: %s — DENIED%s\n", label, tag)
+			fmt.Fprintf(os.Stderr, "[seki] tcp: %s — DENIED%s\n", label, tagSuffix)
 		} else {
-			fmt.Fprintf(os.Stderr, "[seki] tcp: %s%s\n", label, tag)
+			fmt.Fprintf(os.Stderr, "[seki] tcp: %s%s\n", label, tagSuffix)
 		}
 		log.LogTCP(c.Dest, c.SNI)
+		sock.Emit(socket.Event{
+			Type: "tcp", Dest: c.Dest, SNI: c.SNI, Domain: domain,
+			Action: res.Action, Tag: ruleTag, Learned: res.Learned,
+		})
 	})
 	if err := tcpProxy.Start(); err != nil {
 		cmd.Process.Kill()
