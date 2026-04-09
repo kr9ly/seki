@@ -7,6 +7,7 @@ import (
 
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/netns"
+	"github.com/kr9ly/seki/internal/rules"
 )
 
 func main() {
@@ -24,8 +25,7 @@ func main() {
 	case "log":
 		cmdLog()
 	case "rules":
-		fmt.Fprintln(os.Stderr, "seki rules: not yet implemented")
-		os.Exit(1)
+		cmdRules()
 	case "query":
 		fmt.Fprintln(os.Stderr, "seki query: not yet implemented")
 		os.Exit(1)
@@ -145,6 +145,84 @@ func cmdLog() {
 				fmt.Printf("%s  tcp  %s\n", e.Time, e.Dest)
 			}
 		}
+	}
+}
+
+func cmdRules() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: seki rules <list|add|remove>")
+		os.Exit(1)
+	}
+
+	rs, err := rules.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki rules: %v\n", err)
+		os.Exit(1)
+	}
+
+	switch os.Args[2] {
+	case "list":
+		mode := "enforce"
+		if rs.LearningMode {
+			mode = "learning"
+		}
+		fmt.Printf("mode: %s\n\n", mode)
+		for _, r := range rs.Rules {
+			tag := ""
+			if r.Tag != "" {
+				tag = " [" + r.Tag + "]"
+			}
+			fmt.Printf("  %-6s %s%s\n", r.Action, r.Match, tag)
+		}
+
+	case "add":
+		// seki rules add "*.github.com" --allow --tag git
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "usage: seki rules add <match> --allow|--deny [--tag <tag>]")
+			os.Exit(1)
+		}
+		match := os.Args[3]
+		action := rules.Allow
+		tag := ""
+		for i := 4; i < len(os.Args); i++ {
+			switch os.Args[i] {
+			case "--allow":
+				action = rules.Allow
+			case "--deny":
+				action = rules.Deny
+			case "--tag":
+				if i+1 < len(os.Args) {
+					tag = os.Args[i+1]
+					i++
+				}
+			}
+		}
+		rs.AddRule(match, action, tag)
+		if err := rs.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "seki rules: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("added: %s %s\n", action, match)
+
+	case "remove":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "usage: seki rules remove <match>")
+			os.Exit(1)
+		}
+		if rs.RemoveRule(os.Args[3]) {
+			if err := rs.Save(); err != nil {
+				fmt.Fprintf(os.Stderr, "seki rules: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("removed: %s\n", os.Args[3])
+		} else {
+			fmt.Fprintf(os.Stderr, "rule not found: %s\n", os.Args[3])
+			os.Exit(1)
+		}
+
+	default:
+		fmt.Fprintf(os.Stderr, "seki rules: unknown subcommand %q\n", os.Args[2])
+		os.Exit(1)
 	}
 }
 
