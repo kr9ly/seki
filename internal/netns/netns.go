@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	sekidns "github.com/kr9ly/seki/internal/dns"
+	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/proxy"
 )
 
@@ -75,6 +76,16 @@ func Exec(args []string) (*Sandbox, error) {
 		return nil, fmt.Errorf("setup host networking: %w", err)
 	}
 
+	// Open log database
+	log, err := logger.Open()
+	if err != nil {
+		cmd.Process.Kill()
+		sb.Close()
+		return nil, fmt.Errorf("open logger: %w", err)
+	}
+	sb.cleanup = append(sb.cleanup, func() { log.Close() })
+	fmt.Fprintf(os.Stderr, "[seki] session: %s\n", log.SessionID())
+
 	// Detect upstream DNS
 	upstream, err := sekidns.DetectUpstream()
 	if err != nil {
@@ -86,6 +97,7 @@ func Exec(args []string) (*Sandbox, error) {
 	// Start DNS resolver on the gateway address
 	resolver := sekidns.NewResolver(GatewayIP+":53", upstream, func(q sekidns.QueryEntry) {
 		fmt.Fprintf(os.Stderr, "[seki] dns: %s (%s)\n", q.Domain, q.QType)
+		log.LogDNS(q.Domain, q.QType)
 	})
 	if err := resolver.Start(); err != nil {
 		cmd.Process.Kill()
@@ -101,6 +113,7 @@ func Exec(args []string) (*Sandbox, error) {
 		} else {
 			fmt.Fprintf(os.Stderr, "[seki] tcp: %s\n", c.Dest)
 		}
+		log.LogTCP(c.Dest, c.SNI)
 	})
 	if err := tcpProxy.Start(); err != nil {
 		cmd.Process.Kill()
