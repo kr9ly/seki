@@ -1040,12 +1040,6 @@ func restoreTerminal(state *unix.Termios) {
 // cmdForward sets up port forwarding from the host into the seki sandbox.
 // Must be run inside the sandbox (SEKI_SLIRP_API must be set).
 func cmdForward() {
-	apiSock := os.Getenv("SEKI_SLIRP_API")
-	if apiSock == "" {
-		fmt.Fprintln(os.Stderr, "seki forward: not running inside seki sandbox (SEKI_SLIRP_API not set)")
-		os.Exit(1)
-	}
-
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: seki forward <port>")
 		fmt.Fprintln(os.Stderr, "       seki forward --list")
@@ -1054,6 +1048,12 @@ func cmdForward() {
 
 	switch os.Args[2] {
 	case "--list":
+		// --list requires direct slirp API access (run from outside sandbox)
+		apiSock := os.Getenv("SEKI_SLIRP_API")
+		if apiSock == "" {
+			fmt.Fprintln(os.Stderr, "seki forward --list: SEKI_SLIRP_API not set (run from outside sandbox)")
+			os.Exit(1)
+		}
 		entries, err := slirpListHostFwd(apiSock)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "seki forward: %v\n", err)
@@ -1074,44 +1074,52 @@ func cmdForward() {
 			os.Exit(1)
 		}
 
-		id, err := slirpAddHostFwd(apiSock, port, port)
+		// Port forwarding is proxied through the seki parent socket.
+		// The parent calls the slirp4netns API and adds iptables DNAT.
+		sock, err := socket.Connect(false)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "seki forward: %v\n", err)
 			os.Exit(1)
 		}
+		defer sock.Close()
 
-		// Request DNAT via the child process (which has CAP_NET_ADMIN in the outer namespace)
-		if sock, err := socket.Connect(false); err == nil {
-			sock.Emit(socket.Event{Type: "dnat", Port: port})
-			sock.Close()
+		sock.Emit(socket.Event{Type: "forward", Port: port})
+
+		// Wait for response from parent
+		deadline := time.After(5 * time.Second)
+		for {
+			done := make(chan struct{})
+			var e socket.Event
+			var ok bool
+			go func() {
+				ok = sock.Next()
+				if ok {
+					e, _ = sock.Event()
+				}
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				if !ok {
+					fmt.Fprintln(os.Stderr, "seki forward: connection closed")
+					os.Exit(1)
+				}
+				if e.Type == "forward_done" && e.Port == port {
+					fmt.Printf("forwarding port %d (id=%d) — accessible at localhost:%d\n", port, e.ForwardID, port)
+					return
+				}
+				if e.Type == "forward_error" && e.Port == port {
+					fmt.Fprintf(os.Stderr, "seki forward: %s\n", e.Error)
+					os.Exit(1)
+				}
+				// Ignore other events, keep waiting
+			case <-deadline:
+				fmt.Fprintln(os.Stderr, "seki forward: timeout waiting for response")
+				os.Exit(1)
+			}
 		}
-
-		fmt.Printf("forwarding port %d (id=%d) — accessible at localhost:%d\n", port, id, port)
 	}
-}
-
-// slirpAddHostFwd adds a TCP host-to-guest port forward via the slirp4netns API.
-func slirpAddHostFwd(apiSock string, hostPort, guestPort int) (int, error) {
-	req := map[string]interface{}{
-		"execute": "add_hostfwd",
-		"arguments": map[string]interface{}{
-			"proto":      "tcp",
-			"host_addr":  "0.0.0.0",
-			"host_port":  hostPort,
-			"guest_addr": netns.SlirpGuestIP,
-			"guest_port": guestPort,
-		},
-	}
-	resp, err := slirpAPICall(apiSock, req)
-	if err != nil {
-		return 0, err
-	}
-	ret, ok := resp["return"].(map[string]interface{})
-	if !ok {
-		return 0, fmt.Errorf("unexpected response: %v", resp)
-	}
-	id, _ := ret["id"].(float64)
-	return int(id), nil
 }
 
 type hostFwdEntry struct {

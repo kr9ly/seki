@@ -1,6 +1,7 @@
 package netns
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -217,8 +218,34 @@ func Exec(args []string) (*Sandbox, error) {
 	}
 	sb.cleanup = append(sb.cleanup, func() { sock.Close() })
 
-	// Re-broadcast messages from watch to all clients (including child)
+	// Set host user namespace for socket trust verification.
+	// Only connections from the host user namespace (watch) can send
+	// control events (approve/deny). Sandbox connections are untrusted.
+	if hostNS, err := os.Readlink("/proc/self/ns/user"); err == nil {
+		sock.SetHostUserNS(hostNS)
+	}
+
+	// Handle messages from clients.
+	// "forward" events are handled by the parent (slirp API proxy).
+	// All other events are re-broadcast to all clients (including child).
 	sock.OnMessage(func(e socket.Event) {
+		if e.Type == "forward" && e.Port > 0 && e.Port <= 65535 {
+			id, err := slirpAddHostFwd(apiSockPath, e.Port)
+			if err != nil {
+				sock.Emit(socket.Event{
+					Type: "forward_error", Port: e.Port,
+					Error: err.Error(),
+				})
+				return
+			}
+			// Tell child to add iptables DNAT for the forwarded port
+			sock.Emit(socket.Event{Type: "dnat", Port: e.Port})
+			sock.Emit(socket.Event{
+				Type: "forward_done", Port: e.Port,
+				ForwardID: id,
+			})
+			return
+		}
 		sock.Emit(e)
 	})
 
@@ -302,6 +329,16 @@ func ChildSetup() (*ChildState, error) {
 	// Protect seki config from modification by sandboxed process
 	if err := protectSekiConfig(); err != nil {
 		fmt.Fprintf(os.Stderr, "seki: protect config: %v\n", err)
+	}
+
+	// Hide slirp4netns API socket from sandbox by mounting /dev/null over it.
+	// Port forwarding is proxied through the seki parent socket instead.
+	if apiSock := os.Getenv("SEKI_SLIRP_API"); apiSock != "" {
+		if _, err := os.Stat(apiSock); err == nil {
+			if err := syscall.Mount("/dev/null", apiSock, "", syscall.MS_BIND, ""); err != nil {
+				fmt.Fprintf(os.Stderr, "seki: hide slirp api: %v\n", err)
+			}
+		}
 	}
 
 	// Create synthetic /etc/passwd and /etc/group for the nested user namespace
@@ -461,6 +498,11 @@ func ChildSetup() (*ChildState, error) {
 		return nil, fmt.Errorf("iptables: %w", err)
 	}
 
+	// IPv6: best-effort defense-in-depth (non-fatal if ip6tables unavailable)
+	if err := setupIp6tables(); err != nil {
+		fmt.Fprintf(os.Stderr, "seki: ip6tables: %v (IPv6 traffic may not be blocked)\n", err)
+	}
+
 	return cs, nil
 }
 
@@ -508,6 +550,35 @@ func setupIptables() error {
 		return fmt.Errorf("udp drop: %w", err)
 	}
 
+	// ICMP: drop all to prevent ICMP tunneling (seki never uses ICMP)
+	if err := run("iptables", "-A", "OUTPUT", "-p", "icmp",
+		"-j", "DROP"); err != nil {
+		return fmt.Errorf("icmp drop: %w", err)
+	}
+
+	return nil
+}
+
+// setupIp6tables configures IPv6 firewall rules inside the namespace.
+// seki's services are IPv4-only, so all non-loopback IPv6 traffic is dropped.
+// This is defense-in-depth: even if IPv6 becomes available via slirp4netns,
+// traffic cannot bypass seki's DNS/TCP inspection.
+func setupIp6tables() error {
+	// Allow seki's own marked traffic (future-proofing)
+	if err := run("ip6tables", "-A", "OUTPUT",
+		"-m", "mark", "--mark", "0x1", "-j", "ACCEPT"); err != nil {
+		return fmt.Errorf("mark accept: %w", err)
+	}
+	// Allow IPv6 loopback for localhost compatibility
+	if err := run("ip6tables", "-A", "OUTPUT", "-d", "::1/128",
+		"-j", "ACCEPT"); err != nil {
+		return fmt.Errorf("loopback accept: %w", err)
+	}
+	// Drop everything else
+	if err := run("ip6tables", "-A", "OUTPUT",
+		"-j", "DROP"); err != nil {
+		return fmt.Errorf("default drop: %w", err)
+	}
 	return nil
 }
 
@@ -641,6 +712,45 @@ func run(name string, args ...string) error {
 	return nil
 }
 
+// slirpAddHostFwd adds a TCP host-to-guest port forward via the slirp4netns API.
+func slirpAddHostFwd(apiSock string, port int) (int, error) {
+	conn, err := net.Dial("unix", apiSock)
+	if err != nil {
+		return 0, fmt.Errorf("connect slirp api: %w", err)
+	}
+	defer conn.Close()
+
+	req := fmt.Sprintf(
+		`{"execute":"add_hostfwd","arguments":{"proto":"tcp","host_addr":"0.0.0.0","host_port":%d,"guest_addr":"%s","guest_port":%d}}`,
+		port, SlirpGuestIP, port,
+	)
+	if _, err := conn.Write(append([]byte(req), '\n')); err != nil {
+		return 0, fmt.Errorf("write: %w", err)
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return 0, fmt.Errorf("read: %w", err)
+	}
+
+	// Parse {"return":{"id":N}} or {"error":{"desc":"..."}}
+	var resp struct {
+		Return *struct{ ID int `json:"id"` } `json:"return"`
+		Error  *struct{ Desc string `json:"desc"` } `json:"error"`
+	}
+	if err := json.Unmarshal(buf[:n], &resp); err != nil {
+		return 0, fmt.Errorf("parse response: %w", err)
+	}
+	if resp.Error != nil {
+		return 0, fmt.Errorf("slirp: %s", resp.Error.Desc)
+	}
+	if resp.Return != nil {
+		return resp.Return.ID, nil
+	}
+	return 0, nil
+}
+
 // addPreroutingDNAT adds an iptables PREROUTING rule so that traffic from tap0
 // is redirected to localhost, allowing forwarding to reach localhost-bound servers.
 func addPreroutingDNAT(port int) error {
@@ -678,6 +788,11 @@ func buildChildEnv(sekiBin string, sshProxyPath string, secretKeys []string) []s
 			continue
 		}
 		if sshProxyPath != "" && strings.HasPrefix(e, "SSH_AUTH_SOCK=") {
+			continue
+		}
+		// Hide slirp API socket from sandbox; port forwarding is proxied
+		// through the seki parent socket instead.
+		if strings.HasPrefix(e, "SEKI_SLIRP_API=") {
 			continue
 		}
 		// Strip secret env vars — values stay on host, injected via credential proxy.

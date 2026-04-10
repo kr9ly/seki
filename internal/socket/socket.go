@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Event is a real-time notification exchanged between seki components.
@@ -31,7 +33,9 @@ type Event struct {
 	// Approval queue fields
 	QueueSize int `json:"queue_size,omitempty"`
 	// Port forwarding
-	Port int `json:"port,omitempty"`
+	Port      int    `json:"port,omitempty"`
+	ForwardID int    `json:"forward_id,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 // MessageFunc is called when a message is received from a watch client.
@@ -40,11 +44,13 @@ type MessageFunc func(Event)
 // Server streams events to connected watch clients via a Unix socket.
 // It also reads messages from clients (bidirectional).
 type Server struct {
-	path      string
-	ln        net.Listener
-	clients   []net.Conn
-	mu        sync.Mutex
-	onMessage MessageFunc
+	path        string
+	ln          net.Listener
+	clients     []net.Conn
+	mu          sync.Mutex
+	onMessage   MessageFunc
+	hostUserNS  string           // host user namespace inode for trust check
+	clientTrust map[net.Conn]bool // true = trusted (same user NS as host)
 }
 
 // NewServer creates a socket server at ~/.config/seki/seki.sock.
@@ -62,9 +68,19 @@ func NewServer() (*Server, error) {
 	}
 	os.Chmod(path, 0660)
 
-	s := &Server{path: path, ln: ln}
+	s := &Server{path: path, ln: ln, clientTrust: make(map[net.Conn]bool)}
 	go s.accept()
 	return s, nil
+}
+
+// SetHostUserNS sets the host user namespace inode string for connection trust
+// verification. Connections from processes in the same user namespace are trusted
+// (watch clients); connections from different user namespaces (sandbox) are
+// untrusted and their control events (approve/deny) are silently dropped.
+func (s *Server) SetHostUserNS(ns string) {
+	s.mu.Lock()
+	s.hostUserNS = ns
+	s.mu.Unlock()
 }
 
 // OnMessage sets the callback for messages received from watch clients.
@@ -103,6 +119,7 @@ func (s *Server) Close() error {
 		c.Close()
 	}
 	s.clients = nil
+	s.clientTrust = make(map[net.Conn]bool)
 	s.mu.Unlock()
 
 	err := s.ln.Close()
@@ -116,13 +133,60 @@ func (s *Server) accept() {
 		if err != nil {
 			return
 		}
+		trusted := s.checkTrust(conn)
 		s.mu.Lock()
 		s.clients = append(s.clients, conn)
+		s.clientTrust[conn] = trusted
 		s.mu.Unlock()
 
 		// Read messages from this client
 		go s.readFrom(conn)
 	}
+}
+
+// checkTrust verifies whether a connection comes from a process in the host
+// user namespace (trusted) or a sandboxed user namespace (untrusted).
+// Uses SO_PEERCRED to get the peer PID, then compares /proc/<pid>/ns/user.
+func (s *Server) checkTrust(conn net.Conn) bool {
+	s.mu.Lock()
+	hostNS := s.hostUserNS
+	s.mu.Unlock()
+	if hostNS == "" {
+		return true // trust check not configured
+	}
+
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return false
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return false
+	}
+	var cred *unix.Ucred
+	var credErr error
+	err = raw.Control(func(fd uintptr) {
+		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	})
+	if err != nil || credErr != nil || cred == nil {
+		return false
+	}
+	peerNS, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/user", cred.Pid))
+	if err != nil {
+		return false
+	}
+	return peerNS == hostNS
+}
+
+// isControlEvent returns true for event types that affect sandbox security
+// (approval queue resolution). These events are only accepted from trusted
+// (host user namespace) connections.
+func isControlEvent(t string) bool {
+	switch t {
+	case "approve", "deny", "cmd_approve", "cmd_deny":
+		return true
+	}
+	return false
 }
 
 func (s *Server) readFrom(conn net.Conn) {
@@ -132,6 +196,17 @@ func (s *Server) readFrom(conn net.Conn) {
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			continue
 		}
+
+		// Drop control events from untrusted (sandbox) connections
+		if isControlEvent(e.Type) {
+			s.mu.Lock()
+			trusted := s.clientTrust[conn]
+			s.mu.Unlock()
+			if !trusted {
+				continue
+			}
+		}
+
 		s.mu.Lock()
 		fn := s.onMessage
 		s.mu.Unlock()
@@ -139,7 +214,7 @@ func (s *Server) readFrom(conn net.Conn) {
 			fn(e)
 		}
 	}
-	// Client disconnected — remove from clients list
+	// Client disconnected — remove from clients list and trust map
 	s.mu.Lock()
 	for i, c := range s.clients {
 		if c == conn {
@@ -147,6 +222,7 @@ func (s *Server) readFrom(conn net.Conn) {
 			break
 		}
 	}
+	delete(s.clientTrust, conn)
 	s.mu.Unlock()
 }
 
