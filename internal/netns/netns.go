@@ -231,6 +231,12 @@ func ChildSetup() (*ChildState, error) {
 		return nil, fmt.Errorf("override resolv.conf: %w", err)
 	}
 
+	// Bind-mount user's .ssh to /root/.ssh so SSH works under uid 0 mapping
+	if err := bindSSH(); err != nil {
+		// Non-fatal: SSH might not be needed
+		fmt.Fprintf(os.Stderr, "seki: ssh bind-mount: %v\n", err)
+	}
+
 	cs := &ChildState{}
 
 	// Open log database
@@ -439,6 +445,22 @@ func overrideResolvConf() error {
 	}
 
 	return nil
+}
+
+// bindSSH bind-mounts the user's ~/.ssh to /root/.ssh.
+// Inside the user namespace uid is mapped to 0, so SSH looks for /root/.ssh
+// via getpwuid(0) instead of HOME.
+func bindSSH() error {
+	home := os.Getenv("HOME")
+	if home == "" {
+		return nil
+	}
+	sshDir := home + "/.ssh"
+	if _, err := os.Stat(sshDir); err != nil {
+		return nil
+	}
+	os.MkdirAll("/root/.ssh", 0700)
+	return syscall.Mount(sshDir, "/root/.ssh", "", syscall.MS_BIND|syscall.MS_REC, "")
 }
 
 func run(name string, args ...string) error {
