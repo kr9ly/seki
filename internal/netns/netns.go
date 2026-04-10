@@ -320,6 +320,10 @@ func ChildSetup() (*ChildState, error) {
 		if host, _, err := net.SplitHostPort(c.Dest); err == nil {
 			ip = host
 		}
+		// Resolve domain from DNS cache if SNI is empty
+		if domain == "" && ip != "" {
+			domain = resolver.LookupIP(ip)
+		}
 		res := ruleset.Evaluate(domain, ip)
 		ruleTag := ""
 		if res.Rule != nil && res.Rule.Tag != "" {

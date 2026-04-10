@@ -30,6 +30,15 @@ type Resolver struct {
 	onQuery    OnQueryFunc
 	udp        *mdns.Server
 	tcp        *mdns.Server
+	ipCache    sync.Map // IP string -> domain string
+}
+
+// LookupIP returns the domain associated with an IP from DNS resolution cache.
+func (r *Resolver) LookupIP(ip string) string {
+	if v, ok := r.ipCache.Load(ip); ok {
+		return v.(string)
+	}
+	return ""
 }
 
 // NewResolver creates a DNS resolver that listens on listenAddr,
@@ -140,6 +149,19 @@ func (r *Resolver) handle(w mdns.ResponseWriter, req *mdns.Msg) {
 		msg.SetRcode(req, mdns.RcodeServerFailure)
 		w.WriteMsg(msg)
 		return
+	}
+
+	// Cache IP→domain mapping from A/AAAA records
+	for _, q := range req.Question {
+		domain := strings.TrimSuffix(q.Name, ".")
+		for _, rr := range resp.Answer {
+			switch v := rr.(type) {
+			case *mdns.A:
+				r.ipCache.Store(v.A.String(), domain)
+			case *mdns.AAAA:
+				r.ipCache.Store(v.AAAA.String(), domain)
+			}
+		}
 	}
 
 	w.WriteMsg(resp)
