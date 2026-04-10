@@ -218,18 +218,23 @@ func cmdWatch() {
 		}
 	}
 
-	// Read events in background
+	// Event channel (recreated on reconnect)
 	events := make(chan socket.Event, 100)
-	go func() {
-		for client.Next() {
-			e, err := client.Event()
-			if err != nil {
-				continue
+	startEventReader := func(c *socket.Client) chan socket.Event {
+		ch := make(chan socket.Event, 100)
+		go func() {
+			for c.Next() {
+				e, err := c.Event()
+				if err != nil {
+					continue
+				}
+				ch <- e
 			}
-			events <- e
-		}
-		close(events)
-	}()
+			close(ch)
+		}()
+		return ch
+	}
+	events = startEventReader(client)
 
 	// Read keyboard in background
 	keys := make(chan byte, 10)
@@ -252,8 +257,19 @@ func cmdWatch() {
 		select {
 		case e, ok := <-events:
 			if !ok {
-				fmt.Printf("\n%sseki exec disconnected.%s\n", dim, reset)
-				return
+				client.Close()
+				fmt.Printf("\n%sseki exec disconnected. waiting for reconnect...%s\n", dim, reset)
+				queueMu.Lock()
+				queue = nil
+				queueMu.Unlock()
+				client, err = socket.Connect(true)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "seki watch: %v\n", err)
+					return
+				}
+				events = startEventReader(client)
+				fmt.Printf("%sreconnected.%s\n\n", bold, reset)
+				continue
 			}
 
 			switch e.Type {
