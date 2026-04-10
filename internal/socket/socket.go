@@ -214,5 +214,49 @@ func sockPath() (string, error) {
 	}
 	dir := filepath.Join(home, ".config", "seki")
 	os.MkdirAll(dir, 0700)
+	// Per-session socket via SEKI_SOCK env var
+	if name := os.Getenv("SEKI_SOCK"); name != "" {
+		return filepath.Join(dir, name), nil
+	}
 	return filepath.Join(dir, "seki.sock"), nil
+}
+
+// SockGlob returns all active session socket paths.
+// Stale sockets (connection refused) are removed.
+func SockGlob() ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(home, ".config", "seki")
+	matches, err := filepath.Glob(filepath.Join(dir, "seki-*.sock"))
+	if err != nil {
+		return nil, err
+	}
+	// Also include legacy seki.sock
+	legacy := filepath.Join(dir, "seki.sock")
+	if _, err := os.Stat(legacy); err == nil {
+		matches = append(matches, legacy)
+	}
+
+	var alive []string
+	for _, path := range matches {
+		conn, err := net.Dial("unix", path)
+		if err != nil {
+			os.Remove(path) // stale socket
+			continue
+		}
+		conn.Close()
+		alive = append(alive, path)
+	}
+	return alive, nil
+}
+
+// ConnectPath connects to a specific socket path.
+func ConnectPath(path string) (*Client, error) {
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("connect %s: %w", path, err)
+	}
+	return &Client{conn: conn, scanner: bufio.NewScanner(conn)}, nil
 }

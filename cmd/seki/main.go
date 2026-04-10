@@ -156,13 +156,6 @@ func cmdLog() {
 }
 
 func cmdWatch() {
-	client, err := socket.Connect(true)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "seki watch: %v\n", err)
-		os.Exit(1)
-	}
-	defer client.Close()
-
 	const (
 		reset   = "\033[0m"
 		green   = "\033[32m"
@@ -174,16 +167,65 @@ func cmdWatch() {
 		inverse = "\033[7m"
 	)
 
-	// Approval queue state (local mirror)
 	type queueItem struct {
 		domain  string
 		dest    string
-		command string // non-empty for command approvals
+		command string
+		client  *socket.Client // source session for routing approve/deny
 	}
+	type taggedEvent struct {
+		event  socket.Event
+		client *socket.Client
+	}
+
 	var queue []queueItem
 	var queueMu sync.Mutex
 
-	// Set terminal to raw mode for keyboard input
+	events := make(chan taggedEvent, 100)
+	connected := make(map[string]*socket.Client) // path -> client
+	var connMu sync.Mutex
+
+	// Connect to a socket and start reading events
+	attachSession := func(path string) {
+		connMu.Lock()
+		if _, ok := connected[path]; ok {
+			connMu.Unlock()
+			return
+		}
+		c, err := socket.ConnectPath(path)
+		if err != nil {
+			connMu.Unlock()
+			return
+		}
+		connected[path] = c
+		connMu.Unlock()
+
+		go func() {
+			for c.Next() {
+				e, err := c.Event()
+				if err != nil {
+					continue
+				}
+				events <- taggedEvent{event: e, client: c}
+			}
+			// Disconnected
+			connMu.Lock()
+			delete(connected, path)
+			connMu.Unlock()
+			c.Close()
+			events <- taggedEvent{event: socket.Event{Type: "session_disconnect"}, client: c}
+		}()
+	}
+
+	// Scan for sockets and attach
+	scanSockets := func() {
+		paths, _ := socket.SockGlob()
+		for _, p := range paths {
+			attachSession(p)
+		}
+	}
+
+	// Set terminal to raw mode
 	oldState, rawErr := enableRawMode()
 	if rawErr == nil {
 		defer restoreTerminal(oldState)
@@ -218,25 +260,7 @@ func cmdWatch() {
 		}
 	}
 
-	// Event channel (recreated on reconnect)
-	events := make(chan socket.Event, 100)
-	startEventReader := func(c *socket.Client) chan socket.Event {
-		ch := make(chan socket.Event, 100)
-		go func() {
-			for c.Next() {
-				e, err := c.Event()
-				if err != nil {
-					continue
-				}
-				ch <- e
-			}
-			close(ch)
-		}()
-		return ch
-	}
-	events = startEventReader(client)
-
-	// Read keyboard in background
+	// Keyboard input
 	keys := make(chan byte, 10)
 	if rawErr == nil {
 		go func() {
@@ -251,28 +275,36 @@ func cmdWatch() {
 		}()
 	}
 
-	fmt.Printf("%sseki watch%s — connected, waiting for events...\n\n", bold, reset)
+	// Periodic scanner for new sessions
+	go func() {
+		for {
+			scanSockets()
+			time.Sleep(2 * time.Second)
+		}
+	}()
+
+	fmt.Printf("%sseki watch%s — scanning for sessions...\n\n", bold, reset)
 
 	for {
 		select {
-		case e, ok := <-events:
-			if !ok {
-				client.Close()
-				fmt.Printf("\n%sseki exec disconnected. waiting for reconnect...%s\n", dim, reset)
-				queueMu.Lock()
-				queue = nil
-				queueMu.Unlock()
-				client, err = socket.Connect(true)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "seki watch: %v\n", err)
-					return
-				}
-				events = startEventReader(client)
-				fmt.Printf("%sreconnected.%s\n\n", bold, reset)
-				continue
-			}
+		case te := <-events:
+			e := te.event
 
 			switch e.Type {
+			case "session_disconnect":
+				// Remove queue items from this session
+				queueMu.Lock()
+				filtered := queue[:0]
+				for _, item := range queue {
+					if item.client != te.client {
+						filtered = append(filtered, item)
+					}
+				}
+				queue = filtered
+				queueMu.Unlock()
+				fmt.Printf("\n%ssession disconnected.%s\n", dim, reset)
+				renderQueue()
+
 			case "status":
 				mode := "enforce"
 				if e.LearningMode {
@@ -321,7 +353,7 @@ func cmdWatch() {
 
 			case "approval":
 				queueMu.Lock()
-				queue = append(queue, queueItem{domain: e.Domain, dest: e.Dest})
+				queue = append(queue, queueItem{domain: e.Domain, dest: e.Dest, client: te.client})
 				queueMu.Unlock()
 				renderQueue()
 
@@ -358,7 +390,7 @@ func cmdWatch() {
 
 			case "cmd_approval":
 				queueMu.Lock()
-				queue = append(queue, queueItem{command: e.Command})
+				queue = append(queue, queueItem{command: e.Command, client: te.client})
 				queueMu.Unlock()
 				fmt.Printf("%scmd%s  %s — %s⏳ pending%s\n", cyan, reset, e.Command, cyan, reset)
 				renderQueue()
@@ -404,16 +436,16 @@ func cmdWatch() {
 			switch key {
 			case 'a', 'A':
 				if first.command != "" {
-					client.Emit(socket.Event{Type: "cmd_approve", Command: first.command})
+					first.client.Emit(socket.Event{Type: "cmd_approve", Command: first.command})
 				} else {
-					client.Emit(socket.Event{Type: "approve", Domain: first.domain})
+					first.client.Emit(socket.Event{Type: "approve", Domain: first.domain})
 					saveRule(first.domain, rules.Allow)
 				}
 			case 'd', 'D':
 				if first.command != "" {
-					client.Emit(socket.Event{Type: "cmd_deny", Command: first.command})
+					first.client.Emit(socket.Event{Type: "cmd_deny", Command: first.command})
 				} else {
-					client.Emit(socket.Event{Type: "deny", Domain: first.domain})
+					first.client.Emit(socket.Event{Type: "deny", Domain: first.domain})
 					saveRule(first.domain, rules.Deny)
 				}
 			}

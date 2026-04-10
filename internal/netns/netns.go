@@ -47,6 +47,10 @@ func Exec(args []string) (*Sandbox, error) {
 
 	sb := &Sandbox{}
 
+	// Set per-session socket name so multiple seki exec can coexist
+	sockName := fmt.Sprintf("seki-%d.sock", os.Getpid())
+	os.Setenv("SEKI_SOCK", sockName)
+
 	// Sync pipe: parent writes after slirp4netns is ready
 	syncPr, syncPw, err := os.Pipe()
 	if err != nil {
