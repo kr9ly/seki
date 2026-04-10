@@ -749,7 +749,13 @@ func checkCommand(cmd string) {
 			Action:  "prompt",
 		})
 
-		timeout := time.After(30 * time.Second)
+		approvalTimeout := 30 * time.Second
+		if s := os.Getenv("SEKI_APPROVAL_TIMEOUT"); s != "" {
+			if v, err := strconv.Atoi(s); err == nil && v > 0 {
+				approvalTimeout = time.Duration(v) * time.Second
+			}
+		}
+		timeout := time.After(approvalTimeout)
 		events := make(chan socket.Event, 10)
 		go func() {
 			for client.Next() {

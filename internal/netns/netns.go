@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	gosync "sync"
 	"syscall"
 	"time"
 
@@ -289,7 +291,14 @@ type ChildState struct {
 	Queue    *approval.Queue
 }
 
-const approvalTimeout = 30 * time.Second
+var approvalTimeout = func() time.Duration {
+	if s := os.Getenv("SEKI_APPROVAL_TIMEOUT"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return 30 * time.Second
+}()
 
 // Close tears down child resources.
 func (cs *ChildState) Close() {
@@ -374,6 +383,7 @@ func ChildSetup() (*ChildState, error) {
 		cs.Close()
 		return nil, fmt.Errorf("load rules: %w", err)
 	}
+	var rulesMu gosync.RWMutex
 
 	// Connect to parent's socket server for event exchange
 	sock, err := socket.Connect(false)
@@ -403,10 +413,16 @@ func ChildSetup() (*ChildState, error) {
 					if cs.Queue != nil {
 						cs.Queue.Resolve(e.Domain, true)
 					}
+					rulesMu.Lock()
+					ruleset.AddRule(e.Domain, rules.Allow, "", rules.KindNetwork)
+					rulesMu.Unlock()
 				case "deny":
 					if cs.Queue != nil {
 						cs.Queue.Resolve(e.Domain, false)
 					}
+					rulesMu.Lock()
+					ruleset.AddRule(e.Domain, rules.Deny, "", rules.KindNetwork)
+					rulesMu.Unlock()
 				case "dnat":
 					if e.Port > 0 {
 						if err := addPreroutingDNAT(e.Port); err != nil {
@@ -428,7 +444,9 @@ func ChildSetup() (*ChildState, error) {
 
 	// Start DNS resolver (upstream: slirp4netns DNS relay)
 	resolver := sekidns.NewResolver("127.0.0.1:"+DNSPort, SlirpDNS+":53", func(q sekidns.QueryEntry) bool {
+		rulesMu.RLock()
 		res := ruleset.Evaluate(q.Domain, "")
+		rulesMu.RUnlock()
 		ruleTag := ""
 		if res.Rule != nil && res.Rule.Tag != "" {
 			ruleTag = res.Rule.Tag
@@ -461,7 +479,9 @@ func ChildSetup() (*ChildState, error) {
 		if domain == "" && ip != "" {
 			domain = resolver.LookupIP(ip)
 		}
+		rulesMu.RLock()
 		res := ruleset.Evaluate(domain, ip)
+		rulesMu.RUnlock()
 		ruleTag := ""
 		if res.Rule != nil && res.Rule.Tag != "" {
 			ruleTag = res.Rule.Tag
