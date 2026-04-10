@@ -754,6 +754,12 @@ func slirpAddHostFwd(apiSock string, port int) (int, error) {
 // addPreroutingDNAT adds an iptables PREROUTING rule so that traffic from tap0
 // is redirected to localhost, allowing forwarding to reach localhost-bound servers.
 func addPreroutingDNAT(port int) error {
+	// Enable route_localnet so packets arriving on tap0 can be DNATed to 127.0.0.1.
+	// Without this, the kernel silently drops packets routed to loopback from non-loopback interfaces.
+	if err := os.WriteFile("/proc/sys/net/ipv4/conf/tap0/route_localnet", []byte("1"), 0644); err != nil {
+		return fmt.Errorf("enable route_localnet: %w", err)
+	}
+
 	p := fmt.Sprintf("%d", port)
 	dest := "127.0.0.1:" + p
 	// Check if rule already exists (idempotent)
