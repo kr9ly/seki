@@ -35,6 +35,7 @@ type Rule struct {
 // RuleSet is the complete rule configuration.
 type RuleSet struct {
 	Rules        []Rule `json:"rules"`
+	HostPorts    []int  `json:"host_ports,omitempty"`
 	LearningMode bool   `json:"learning_mode"`
 }
 

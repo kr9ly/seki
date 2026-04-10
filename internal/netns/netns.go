@@ -25,6 +25,7 @@ const (
 	ProxyPort = "10200"
 	DNSPort   = "5353"
 	// slirp4netns defaults
+	SlirpGateway = "10.0.2.2"
 	SlirpDNS     = "10.0.2.3"
 	SlirpGuestIP = "10.0.2.100"
 
@@ -284,6 +285,7 @@ type ChildState struct {
 	resolver *sekidns.Resolver
 	proxy    *proxy.Proxy
 	sock     *socket.Client
+	hostFwds []*hostForwarder
 	Queue    *approval.Queue
 }
 
@@ -291,6 +293,9 @@ const approvalTimeout = 30 * time.Second
 
 // Close tears down child resources.
 func (cs *ChildState) Close() {
+	for _, fwd := range cs.hostFwds {
+		fwd.Close()
+	}
 	if cs.proxy != nil {
 		cs.proxy.Close()
 	}
@@ -491,6 +496,16 @@ func ChildSetup() (*ChildState, error) {
 		return nil, fmt.Errorf("start TCP proxy: %w", err)
 	}
 	cs.proxy = tcpProxy
+
+	// Start host port forwarders (sandbox localhost → host via slirp gateway)
+	for _, port := range ruleset.HostPorts {
+		fwd, err := startHostForwarder(port)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki: host port %d: %v\n", port, err)
+			continue
+		}
+		cs.hostFwds = append(cs.hostFwds, fwd)
+	}
 
 	// Apply iptables rules (all namespace-scoped)
 	if err := setupIptables(); err != nil {

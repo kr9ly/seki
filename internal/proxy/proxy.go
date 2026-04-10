@@ -78,9 +78,9 @@ func (p *Proxy) Close() error {
 	return nil
 }
 
-// markDialer creates outgoing connections with SO_MARK=1
+// MarkDialer creates outgoing connections with SO_MARK=1
 // to bypass iptables REDIRECT rules.
-var markDialer = &net.Dialer{
+var MarkDialer = &net.Dialer{
 	Timeout: 10 * time.Second,
 	Control: func(network, address string, c syscall.RawConn) error {
 		return c.Control(func(fd uintptr) {
@@ -127,7 +127,7 @@ func (p *Proxy) handle(client *net.TCPConn) {
 	}
 
 	// Connect to the real destination with SO_MARK to bypass iptables
-	remote, err := markDialer.Dial("tcp", dest)
+	remote, err := MarkDialer.Dial("tcp", dest)
 	if err != nil {
 		return
 	}

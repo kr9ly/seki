@@ -26,7 +26,7 @@ import (
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: seki <command> [args...]")
-		fmt.Fprintln(os.Stderr, "commands: exec, log, rules, check, query, watch, mode, credential, forward")
+		fmt.Fprintln(os.Stderr, "commands: exec, log, rules, check, query, watch, mode, credential, forward, host-port")
 		os.Exit(1)
 	}
 
@@ -53,6 +53,8 @@ func main() {
 		cmdCredential()
 	case "forward":
 		cmdForward()
+	case "host-port":
+		cmdHostPort()
 	default:
 		fmt.Fprintf(os.Stderr, "seki: unknown command %q\n", os.Args[1])
 		os.Exit(1)
@@ -1119,6 +1121,96 @@ func cmdForward() {
 				os.Exit(1)
 			}
 		}
+	}
+}
+
+func cmdHostPort() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: seki host-port add <port>")
+		fmt.Fprintln(os.Stderr, "       seki host-port remove <port>")
+		fmt.Fprintln(os.Stderr, "       seki host-port list")
+		os.Exit(1)
+	}
+
+	switch os.Args[2] {
+	case "list":
+		rs, err := rules.Load()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+			os.Exit(1)
+		}
+		if len(rs.HostPorts) == 0 {
+			fmt.Println("no host ports configured")
+			return
+		}
+		for _, p := range rs.HostPorts {
+			fmt.Println(p)
+		}
+
+	case "add":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "usage: seki host-port add <port>")
+			os.Exit(1)
+		}
+		port, err := strconv.Atoi(os.Args[3])
+		if err != nil || port < 1 || port > 65535 {
+			fmt.Fprintf(os.Stderr, "seki host-port: invalid port: %s\n", os.Args[3])
+			os.Exit(1)
+		}
+		rs, err := rules.Load()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+			os.Exit(1)
+		}
+		for _, p := range rs.HostPorts {
+			if p == port {
+				fmt.Printf("host port %d already configured\n", port)
+				return
+			}
+		}
+		rs.HostPorts = append(rs.HostPorts, port)
+		if err := rs.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("added host port %d (effective on next seki exec)\n", port)
+
+	case "remove":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "usage: seki host-port remove <port>")
+			os.Exit(1)
+		}
+		port, err := strconv.Atoi(os.Args[3])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki host-port: invalid port: %s\n", os.Args[3])
+			os.Exit(1)
+		}
+		rs, err := rules.Load()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+			os.Exit(1)
+		}
+		found := false
+		for i, p := range rs.HostPorts {
+			if p == port {
+				rs.HostPorts = append(rs.HostPorts[:i], rs.HostPorts[i+1:]...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			fmt.Fprintf(os.Stderr, "seki host-port: port %d not configured\n", port)
+			os.Exit(1)
+		}
+		if err := rs.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("removed host port %d\n", port)
+
+	default:
+		fmt.Fprintf(os.Stderr, "seki host-port: unknown subcommand %q\n", os.Args[2])
+		os.Exit(1)
 	}
 }
 
