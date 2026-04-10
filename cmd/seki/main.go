@@ -98,12 +98,23 @@ func cmdChild() {
 	}
 	defer state.Close()
 
-	// Run user command as subprocess
+	// Run user command as subprocess in a nested user namespace so it
+	// appears as non-root (uid SandboxUID). The outer namespace keeps uid 0
+	// for ChildSetup's mount/iptables operations.
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), "SEKI_ACTIVE=1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWUSER,
+		UidMappings: []syscall.SysProcIDMap{
+			{ContainerID: netns.SandboxUID, HostID: 0, Size: 1},
+		},
+		GidMappings: []syscall.SysProcIDMap{
+			{ContainerID: netns.SandboxGID, HostID: 0, Size: 1},
+		},
+	}
 
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -1069,10 +1080,10 @@ func cmdForward() {
 			os.Exit(1)
 		}
 
-		// DNAT so that traffic arriving on tap0 reaches localhost-bound servers
-		if err := addPreroutingDNAT(port); err != nil {
-			fmt.Fprintf(os.Stderr, "seki forward: warning: iptables DNAT failed: %v\n", err)
-			fmt.Fprintln(os.Stderr, "  (dev server must bind to 0.0.0.0 instead of localhost)")
+		// Request DNAT via the child process (which has CAP_NET_ADMIN in the outer namespace)
+		if sock, err := socket.Connect(false); err == nil {
+			sock.Emit(socket.Event{Type: "dnat", Port: port})
+			sock.Close()
 		}
 
 		fmt.Printf("forwarding port %d (id=%d) — accessible at localhost:%d\n", port, id, port)
@@ -1168,18 +1179,3 @@ func slirpAPICall(apiSock string, req map[string]interface{}) (map[string]interf
 	return resp, nil
 }
 
-// addPreroutingDNAT adds an iptables PREROUTING rule so that traffic from tap0
-// is redirected to localhost, allowing forwarding to reach localhost-bound servers.
-func addPreroutingDNAT(port int) error {
-	p := strconv.Itoa(port)
-	dest := "127.0.0.1:" + p
-	// Check if rule already exists (idempotent)
-	if err := exec.Command("iptables", "-t", "nat", "-C", "PREROUTING",
-		"-i", "tap0", "-p", "tcp", "--dport", p,
-		"-j", "DNAT", "--to-destination", dest).Run(); err == nil {
-		return nil // already exists
-	}
-	return exec.Command("iptables", "-t", "nat", "-A", "PREROUTING",
-		"-i", "tap0", "-p", "tcp", "--dport", p,
-		"-j", "DNAT", "--to-destination", dest).Run()
-}

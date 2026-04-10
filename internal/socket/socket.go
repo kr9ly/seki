@@ -30,6 +30,8 @@ type Event struct {
 	LearningMode bool   `json:"learning_mode,omitempty"`
 	// Approval queue fields
 	QueueSize int `json:"queue_size,omitempty"`
+	// Port forwarding
+	Port int `json:"port,omitempty"`
 }
 
 // MessageFunc is called when a message is received from a watch client.

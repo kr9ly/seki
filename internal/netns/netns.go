@@ -26,6 +26,13 @@ const (
 	// slirp4netns defaults
 	SlirpDNS     = "10.0.2.3"
 	SlirpGuestIP = "10.0.2.100"
+
+	// SandboxUID/GID is the uid/gid the user command runs as inside the
+	// nested user namespace. The outer namespace uses uid 0 for setup
+	// (mounts, iptables), then the user command drops to this uid via
+	// a nested CLONE_NEWUSER.
+	SandboxUID = 1000
+	SandboxGID = 1000
 )
 
 // Sandbox holds the state of an isolated network namespace.
@@ -297,6 +304,11 @@ func ChildSetup() (*ChildState, error) {
 		fmt.Fprintf(os.Stderr, "seki: protect config: %v\n", err)
 	}
 
+	// Create synthetic /etc/passwd and /etc/group for the nested user namespace
+	if err := setupSandboxUser(); err != nil {
+		fmt.Fprintf(os.Stderr, "seki: sandbox user setup: %v\n", err)
+	}
+
 	// Bind-mount user's .ssh to /root/.ssh so SSH works under uid 0 mapping
 	if err := bindSSH(); err != nil {
 		// Non-fatal: SSH might not be needed
@@ -350,6 +362,13 @@ func ChildSetup() (*ChildState, error) {
 				case "deny":
 					if cs.Queue != nil {
 						cs.Queue.Resolve(e.Domain, false)
+					}
+				case "dnat":
+					if e.Port > 0 {
+						if err := addPreroutingDNAT(e.Port); err != nil {
+							fmt.Fprintf(os.Stderr, "seki: DNAT for port %d failed: %v\n", e.Port, err)
+							fmt.Fprintln(os.Stderr, "  (dev server must bind to 0.0.0.0 instead of localhost)")
+						}
 					}
 				}
 			}
@@ -537,6 +556,47 @@ func protectSekiConfig() error {
 	return nil
 }
 
+// setupSandboxUser creates synthetic /etc/passwd and /etc/group entries so that
+// the nested user namespace (where uid=SandboxUID) can resolve the user identity.
+// Must be called after overrideResolvConf (which makes the mount namespace private).
+func setupSandboxUser() error {
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = "/tmp"
+	}
+	user := os.Getenv("USER")
+	if user == "" {
+		user = "seki"
+	}
+
+	// Synthetic /etc/passwd with root (for setup phase) and sandbox user
+	passwd := fmt.Sprintf(
+		"root:x:0:0:root:/root:/bin/bash\n%s:x:%d:%d:%s:%s:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n",
+		user, SandboxUID, SandboxGID, user, home,
+	)
+	tmpPasswd := fmt.Sprintf("/tmp/seki-passwd-%d", os.Getpid())
+	if err := os.WriteFile(tmpPasswd, []byte(passwd), 0644); err != nil {
+		return fmt.Errorf("write passwd: %w", err)
+	}
+	defer os.Remove(tmpPasswd)
+	if err := syscall.Mount(tmpPasswd, "/etc/passwd", "", syscall.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind mount passwd: %w", err)
+	}
+
+	// Synthetic /etc/group
+	group := fmt.Sprintf("root:x:0:\n%s:x:%d:\nnogroup:x:65534:\n", user, SandboxGID)
+	tmpGroup := fmt.Sprintf("/tmp/seki-group-%d", os.Getpid())
+	if err := os.WriteFile(tmpGroup, []byte(group), 0644); err != nil {
+		return fmt.Errorf("write group: %w", err)
+	}
+	defer os.Remove(tmpGroup)
+	if err := syscall.Mount(tmpGroup, "/etc/group", "", syscall.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind mount group: %w", err)
+	}
+
+	return nil
+}
+
 // bindSSH copies SSH config and known_hosts to /root/.ssh inside the namespace.
 // Inside the user namespace uid is mapped to 0, so SSH looks for /root/.ssh
 // via getpwuid(0) instead of HOME. Private keys are intentionally NOT copied;
@@ -579,6 +639,22 @@ func run(name string, args ...string) error {
 		return fmt.Errorf("%s %s: %s: %w", name, strings.Join(args, " "), strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+// addPreroutingDNAT adds an iptables PREROUTING rule so that traffic from tap0
+// is redirected to localhost, allowing forwarding to reach localhost-bound servers.
+func addPreroutingDNAT(port int) error {
+	p := fmt.Sprintf("%d", port)
+	dest := "127.0.0.1:" + p
+	// Check if rule already exists (idempotent)
+	if err := exec.Command("iptables", "-t", "nat", "-C", "PREROUTING",
+		"-i", "tap0", "-p", "tcp", "--dport", p,
+		"-j", "DNAT", "--to-destination", dest).Run(); err == nil {
+		return nil // already exists
+	}
+	return exec.Command("iptables", "-t", "nat", "-A", "PREROUTING",
+		"-i", "tap0", "-p", "tcp", "--dport", p,
+		"-j", "DNAT", "--to-destination", dest).Run()
 }
 
 // buildChildEnv constructs the environment for the child process.
