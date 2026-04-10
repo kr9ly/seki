@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -321,6 +322,14 @@ func cmdWatch() {
 		restoreCursor()
 	}
 
+	// cwdTag returns a short project-name prefix from an event's Cwd field.
+	cwdTag := func(cwd string) string {
+		if cwd == "" {
+			return ""
+		}
+		return dim + "[" + filepath.Base(cwd) + "]" + reset + " "
+	}
+
 	// renderQueueArea redraws the fixed bottom area.
 	// Must be called with queueMu held.
 	renderQueueArea := func() {
@@ -438,7 +447,7 @@ func cmdWatch() {
 				if e.LearningMode {
 					mode = "learning"
 				}
-				logPrint("%ssession: %s  mode: %s%s", dim, e.Session, mode, reset)
+				logPrint("%s%ssession: %s  mode: %s%s", cwdTag(e.Cwd), dim, e.Session, mode, reset)
 
 			case "dns":
 				color := green
@@ -454,7 +463,7 @@ func cmdWatch() {
 				if e.Tag != "" {
 					tag = dim + " [" + e.Tag + "]" + reset
 				}
-				logPrint("%sdns%s  %s (%s)%s%s", color, reset, e.Domain, e.QType, suffix, tag)
+				logPrint("%s%sdns%s  %s (%s)%s%s", cwdTag(e.Cwd), color, reset, e.Domain, e.QType, suffix, tag)
 
 			case "tcp":
 				color := green
@@ -477,7 +486,7 @@ func cmdWatch() {
 				if e.Tag != "" {
 					tag = dim + " [" + e.Tag + "]" + reset
 				}
-				logPrint("%stcp%s  %s%s%s", color, reset, label, suffix, tag)
+				logPrint("%s%stcp%s  %s%s%s", cwdTag(e.Cwd), color, reset, label, suffix, tag)
 
 			case "approval":
 				queueMu.Lock()
@@ -493,7 +502,7 @@ func cmdWatch() {
 						break
 					}
 				}
-				logPrint("%s✓ approved: %s%s", green, e.Domain, reset)
+				logPrint("%s%s✓ approved: %s%s", cwdTag(e.Cwd), green, e.Domain, reset)
 				renderQueueArea()
 				queueMu.Unlock()
 
@@ -505,7 +514,7 @@ func cmdWatch() {
 						break
 					}
 				}
-				logPrint("%s✗ denied: %s%s", red, e.Domain, reset)
+				logPrint("%s%s✗ denied: %s%s", cwdTag(e.Cwd), red, e.Domain, reset)
 				renderQueueArea()
 				queueMu.Unlock()
 
@@ -514,12 +523,12 @@ func cmdWatch() {
 				if e.Tag != "" {
 					tag = dim + " [" + e.Tag + "]" + reset
 				}
-				logPrint("%scmd%s  %s%s", dim, reset, e.Command, tag)
+				logPrint("%s%scmd%s  %s%s", cwdTag(e.Cwd), dim, reset, e.Command, tag)
 
 			case "cmd_approval":
 				queueMu.Lock()
 				queue = append(queue, queueItem{command: e.Command, client: te.client})
-				logPrint("%scmd%s  %s — %s⏳ pending%s", cyan, reset, e.Command, cyan, reset)
+				logPrint("%s%scmd%s  %s — %s⏳ pending%s", cwdTag(e.Cwd), cyan, reset, e.Command, cyan, reset)
 				renderQueueArea()
 				queueMu.Unlock()
 
@@ -531,7 +540,7 @@ func cmdWatch() {
 						break
 					}
 				}
-				logPrint("%s✓ approved cmd: %s%s", green, e.Command, reset)
+				logPrint("%s%s✓ approved cmd: %s%s", cwdTag(e.Cwd), green, e.Command, reset)
 				renderQueueArea()
 				queueMu.Unlock()
 
@@ -543,7 +552,7 @@ func cmdWatch() {
 						break
 					}
 				}
-				logPrint("%s✗ denied cmd: %s%s", red, e.Command, reset)
+				logPrint("%s%s✗ denied cmd: %s%s", cwdTag(e.Cwd), red, e.Command, reset)
 				renderQueueArea()
 				queueMu.Unlock()
 			}

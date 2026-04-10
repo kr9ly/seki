@@ -611,26 +611,29 @@ credential helper proxy 完成後にこの bind-mount は削除する。
 - [x] DNS リゾルバ (127.0.0.1:5353, SO_MARK bypass, slirp4netns DNS upstream)
 - [x] TCP プロキシ (127.0.0.1:10200, SO_ORIGINAL_DST + SO_MARK, SNI 抽出)
 - [x] iptables REDIRECT + DNAT (namespace 内、ホスト無影響)
-- [x] ルール評価エンジン (glob + CIDR マッチ、learning/enforce mode)
+- [x] ルール評価エンジン (glob + CIDR マッチ、learning/enforce mode、specificity ソート)
 - [x] SQLite ログ永続化 (WAL mode)
-- [x] seki watch (Unix socket イベントストリーム)
+- [x] seki watch (Unix socket イベントストリーム、複数セッション対応、接続復帰)
+- [x] watch TUI (スクロールリージョン 2 領域分離、承認キュー対話操作、ルール自動永続化)
 - [x] DNS NXDOMAIN 返却 (deny 時)
 - [x] TCP 接続拒否 (deny 時)
+- [x] DNS キャッシュ (TCP 接続時のドメイン名逆引き補完)
 - [x] learning mode で Claude Code の通信パターン観察を確認
 - [x] PostToolUse hook (`seki hook post-bash` — ブロック通知注入)
 - [x] PreToolUse hook (`seki hook pre-bash` — コマンド承認連携)
+- [x] seki mode (learning/enforce 切り替え)
+- [x] seki query (ブロック情報クエリ、--format=hook 対応)
+- [x] credentials.json (クレデンシャルマッピング設定)
+- [x] git credential helper proxy (socket 経由で host から取得)
+- [x] SSH agent proxy (署名リクエスト転送、秘密鍵は sandbox に入らない)
+- [x] .ssh コピーベース配置 (config + known_hosts のみ、秘密鍵なし)
+- [x] 環境変数フィルタ (sandbox 起動時に SecretKeys() 参照の環境変数を除外)
+- [x] ~/.config/seki/ read-only bind mount (ルール・設定の改ざん防止)
 
 ### 未実装
-- [ ] watch TUI の対話操作 (ルール追加)
 - [ ] ECH 除去 (HTTPS/SVCB レコードから ECH 設定を除去)
-- [ ] メタデータ read-only bind mount
 - [ ] 起動時パーミッションチェック
 - [ ] ルール自動提案 (`seki log --suggest` 的な)
-- [ ] 環境変数フィルタ (sandbox 起動時に秘密の環境変数を除外)
-- [ ] seki-credential (git credential helper proxy — socket 経由で host から取得)
-- [ ] SSH agent proxy (署名リクエスト転送、秘密鍵は sandbox に入らない)
-- [ ] credentials.json (クレデンシャルマッピング設定)
-- [ ] .ssh bind-mount 削除 (credential helper proxy 完成後)
 
 ## 確定済み設計判断
 

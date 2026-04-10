@@ -56,6 +56,11 @@ func Exec(args []string) (*Sandbox, error) {
 	credSockName := fmt.Sprintf("seki-cred-%d.sock", os.Getpid())
 	os.Setenv("SEKI_CRED_SOCK", credSockName)
 
+	// Pass caller's cwd so watch can display which project a session belongs to
+	if cwd, err := os.Getwd(); err == nil {
+		os.Setenv("SEKI_CWD", cwd)
+	}
+
 	// Sync pipe: parent writes after slirp4netns is ready
 	syncPr, syncPw, err := os.Pipe()
 	if err != nil {
@@ -74,6 +79,9 @@ func Exec(args []string) (*Sandbox, error) {
 	// Start credential socket server before cmd.Start() so the path is
 	// known when we build cmd.Env below.
 	credCfg, err := credential.LoadConfig()
+	if credCfg == nil {
+		credCfg = &credential.Config{}
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "seki: credential config: %v\n", err)
 	} else if len(credCfg.Credentials) > 0 {
@@ -108,7 +116,7 @@ func Exec(args []string) (*Sandbox, error) {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = buildChildEnv(self, sshProxyPath)
+	cmd.Env = buildChildEnv(self, sshProxyPath, credCfg.SecretKeys())
 	cmd.ExtraFiles = []*os.File{syncPr} // fd 3
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET | syscall.CLONE_NEWNS,
@@ -271,6 +279,11 @@ func ChildSetup() (*ChildState, error) {
 		return nil, fmt.Errorf("override resolv.conf: %w", err)
 	}
 
+	// Protect seki config from modification by sandboxed process
+	if err := protectSekiConfig(); err != nil {
+		fmt.Fprintf(os.Stderr, "seki: protect config: %v\n", err)
+	}
+
 	// Bind-mount user's .ssh to /root/.ssh so SSH works under uid 0 mapping
 	if err := bindSSH(); err != nil {
 		// Non-fatal: SSH might not be needed
@@ -300,8 +313,10 @@ func ChildSetup() (*ChildState, error) {
 	}
 	cs.sock = sock
 
+	sessionCwd := os.Getenv("SEKI_CWD")
 	emitEvent := func(e socket.Event) {
 		if cs.sock != nil {
+			e.Cwd = sessionCwd
 			cs.sock.Emit(e)
 		}
 	}
@@ -487,6 +502,28 @@ func overrideResolvConf() error {
 	return nil
 }
 
+// protectSekiConfig bind-mounts ~/.config/seki/ as read-only to prevent
+// the sandboxed process from tampering with rules or credential config.
+func protectSekiConfig() error {
+	home := os.Getenv("HOME")
+	if home == "" {
+		return nil
+	}
+	sekiDir := filepath.Join(home, ".config", "seki")
+	if _, err := os.Stat(sekiDir); err != nil {
+		return nil // no config dir, nothing to protect
+	}
+	// Bind mount on itself
+	if err := syscall.Mount(sekiDir, sekiDir, "", syscall.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind mount: %w", err)
+	}
+	// Remount as read-only
+	if err := syscall.Mount("", sekiDir, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY, ""); err != nil {
+		return fmt.Errorf("remount ro: %w", err)
+	}
+	return nil
+}
+
 // bindSSH copies SSH config and known_hosts to /root/.ssh inside the namespace.
 // Inside the user namespace uid is mapped to 0, so SSH looks for /root/.ssh
 // via getpwuid(0) instead of HOME. Private keys are intentionally NOT copied;
@@ -532,12 +569,18 @@ func run(name string, args ...string) error {
 }
 
 // buildChildEnv constructs the environment for the child process.
-// It injects git credential helper config and filters conflicting GIT_CONFIG_* vars.
+// It injects git credential helper config, filters conflicting GIT_CONFIG_* vars,
+// and strips secret environment variables referenced by credential config.
 // If sshProxyPath is non-empty, SSH_AUTH_SOCK is replaced with the proxy socket path.
-func buildChildEnv(sekiBin string, sshProxyPath string) []string {
+func buildChildEnv(sekiBin string, sshProxyPath string, secretKeys []string) []string {
 	env := os.Environ()
-	// Filter existing GIT_CONFIG_* to avoid conflicts.
-	// Also filter SSH_AUTH_SOCK when a proxy is active (will be re-added below).
+
+	// Build set of secret key prefixes for O(1) lookup.
+	secrets := make(map[string]struct{}, len(secretKeys))
+	for _, k := range secretKeys {
+		secrets[k+"="] = struct{}{}
+	}
+
 	filtered := make([]string, 0, len(env)+4)
 	for _, e := range env {
 		if strings.HasPrefix(e, "GIT_CONFIG_COUNT=") ||
@@ -546,6 +589,17 @@ func buildChildEnv(sekiBin string, sshProxyPath string) []string {
 			continue
 		}
 		if sshProxyPath != "" && strings.HasPrefix(e, "SSH_AUTH_SOCK=") {
+			continue
+		}
+		// Strip secret env vars — values stay on host, injected via credential proxy.
+		skip := false
+		for prefix := range secrets {
+			if strings.HasPrefix(e, prefix) {
+				skip = true
+				break
+			}
+		}
+		if skip {
 			continue
 		}
 		filtered = append(filtered, e)

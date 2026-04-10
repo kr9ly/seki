@@ -25,6 +25,7 @@ type Event struct {
 	Command string `json:"command,omitempty"` // command string (for cmd events)
 	// Status event fields
 	Session      string `json:"session,omitempty"`
+	Cwd          string `json:"cwd,omitempty"`
 	LearningMode bool   `json:"learning_mode,omitempty"`
 	// Approval queue fields
 	QueueSize int `json:"queue_size,omitempty"`
