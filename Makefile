@@ -4,7 +4,8 @@ build:
 	go build -o seki ./cmd/seki
 
 install:
-	go install ./cmd/seki
+	rm -f "$$(go env GOPATH)/bin/seki"
+	go build -o "$$(go env GOPATH)/bin/seki" ./cmd/seki
 
 clean:
 	rm -f seki
