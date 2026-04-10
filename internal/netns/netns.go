@@ -338,7 +338,9 @@ func ChildSetup() (*ChildState, error) {
 
 	// Hide slirp4netns API socket from sandbox by mounting /dev/null over it.
 	// Port forwarding is proxied through the seki parent socket instead.
-	if apiSock := os.Getenv("SEKI_SLIRP_API"); apiSock != "" {
+	// __SEKI_SLIRP_API is the internal env var (SEKI_SLIRP_API is filtered from child).
+	if apiSock := os.Getenv("__SEKI_SLIRP_API"); apiSock != "" {
+		os.Unsetenv("__SEKI_SLIRP_API")
 		if _, err := os.Stat(apiSock); err == nil {
 			if err := syscall.Mount("/dev/null", apiSock, "", syscall.MS_BIND, ""); err != nil {
 				fmt.Fprintf(os.Stderr, "seki: hide slirp api: %v\n", err)
@@ -811,9 +813,10 @@ func buildChildEnv(sekiBin string, sshProxyPath string, secretKeys []string) []s
 		if sshProxyPath != "" && strings.HasPrefix(e, "SSH_AUTH_SOCK=") {
 			continue
 		}
-		// Hide slirp API socket from sandbox; port forwarding is proxied
-		// through the seki parent socket instead.
+		// Hide slirp API socket path from sandbox; pass as internal var for
+		// ChildSetup to bind-mount /dev/null over it before dropping to user cmd.
 		if strings.HasPrefix(e, "SEKI_SLIRP_API=") {
+			filtered = append(filtered, "__"+e)
 			continue
 		}
 		// Strip secret env vars — values stay on host, injected via credential proxy.
