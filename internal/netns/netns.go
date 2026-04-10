@@ -459,7 +459,13 @@ func bindSSH() error {
 	if _, err := os.Stat(sshDir); err != nil {
 		return nil
 	}
-	os.MkdirAll("/root/.ssh", 0700)
+	// /root is owned by real root — mount tmpfs over it so we can write
+	if err := syscall.Mount("tmpfs", "/root", "tmpfs", 0, "size=1m"); err != nil {
+		return fmt.Errorf("tmpfs /root: %w", err)
+	}
+	if err := os.MkdirAll("/root/.ssh", 0700); err != nil {
+		return fmt.Errorf("mkdir /root/.ssh: %w", err)
+	}
 	return syscall.Mount(sshDir, "/root/.ssh", "", syscall.MS_BIND|syscall.MS_REC, "")
 }
 
