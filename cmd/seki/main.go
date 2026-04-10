@@ -1050,11 +1050,56 @@ func restoreTerminal(state *unix.Termios) {
 func cmdForward() {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: seki forward <port>")
+		fmt.Fprintln(os.Stderr, "       seki forward --remove <port>")
 		fmt.Fprintln(os.Stderr, "       seki forward --list")
 		os.Exit(1)
 	}
 
 	switch os.Args[2] {
+	case "--remove":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "usage: seki forward --remove <port>")
+			os.Exit(1)
+		}
+		port, err := strconv.Atoi(os.Args[3])
+		if err != nil || port < 1 || port > 65535 {
+			fmt.Fprintf(os.Stderr, "seki forward: invalid port: %s\n", os.Args[3])
+			os.Exit(1)
+		}
+		sock, err := socket.Connect(false)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki forward: %v\n", err)
+			os.Exit(1)
+		}
+		defer sock.Close()
+		sock.Emit(socket.Event{Type: "forward_remove", Port: port})
+		deadline := time.After(5 * time.Second)
+		for {
+			done := make(chan struct{})
+			var e socket.Event
+			var ok bool
+			go func() {
+				ok = sock.Next()
+				if ok {
+					e, _ = sock.Event()
+				}
+				close(done)
+			}()
+			select {
+			case <-done:
+				if !ok {
+					fmt.Fprintln(os.Stderr, "seki forward: connection closed")
+					os.Exit(1)
+				}
+				if e.Type == "forward_removed" && e.Port == port {
+					fmt.Printf("removed forward port %d (effective on next restart)\n", port)
+					return
+				}
+			case <-deadline:
+				fmt.Fprintln(os.Stderr, "seki forward: timeout")
+				os.Exit(1)
+			}
+		}
 	case "--list":
 		// --list requires direct slirp API access (run from outside sandbox)
 		apiSock := os.Getenv("SEKI_SLIRP_API")
@@ -1163,23 +1208,44 @@ func cmdHostPort() {
 			fmt.Fprintf(os.Stderr, "seki host-port: invalid port: %s\n", os.Args[3])
 			os.Exit(1)
 		}
-		rs, err := rules.Load()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
-			os.Exit(1)
-		}
-		for _, p := range rs.HostPorts {
-			if p == port {
-				fmt.Printf("host port %d already configured\n", port)
-				return
+		if os.Getenv("SEKI_ACTIVE") == "1" {
+			// Inside sandbox: send event to parent (rules.json is read-only here)
+			sock, err := socket.Connect(false)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+				os.Exit(1)
 			}
+			defer sock.Close()
+			sock.Emit(socket.Event{Type: "host_port_add", Port: port})
+			fmt.Printf("host port %d added (live)\n", port)
+		} else {
+			// Outside sandbox: write directly + notify running sessions
+			rs, err := rules.Load()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+				os.Exit(1)
+			}
+			for _, p := range rs.HostPorts {
+				if p == port {
+					fmt.Printf("host port %d already configured\n", port)
+					return
+				}
+			}
+			rs.HostPorts = append(rs.HostPorts, port)
+			if err := rs.Save(); err != nil {
+				fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+				os.Exit(1)
+			}
+			// Notify running sessions
+			paths, _ := socket.SockGlob()
+			for _, p := range paths {
+				if c, err := socket.ConnectPath(p); err == nil {
+					c.Emit(socket.Event{Type: "host_port_add", Port: port})
+					c.Close()
+				}
+			}
+			fmt.Printf("added host port %d\n", port)
 		}
-		rs.HostPorts = append(rs.HostPorts, port)
-		if err := rs.Save(); err != nil {
-			fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("added host port %d (effective on next seki exec)\n", port)
 
 	case "remove":
 		if len(os.Args) < 4 {
@@ -1191,28 +1257,46 @@ func cmdHostPort() {
 			fmt.Fprintf(os.Stderr, "seki host-port: invalid port: %s\n", os.Args[3])
 			os.Exit(1)
 		}
-		rs, err := rules.Load()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
-			os.Exit(1)
-		}
-		found := false
-		for i, p := range rs.HostPorts {
-			if p == port {
-				rs.HostPorts = append(rs.HostPorts[:i], rs.HostPorts[i+1:]...)
-				found = true
-				break
+		if os.Getenv("SEKI_ACTIVE") == "1" {
+			sock, err := socket.Connect(false)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+				os.Exit(1)
 			}
+			defer sock.Close()
+			sock.Emit(socket.Event{Type: "host_port_remove", Port: port})
+			fmt.Printf("host port %d removed\n", port)
+		} else {
+			rs, err := rules.Load()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+				os.Exit(1)
+			}
+			found := false
+			for i, p := range rs.HostPorts {
+				if p == port {
+					rs.HostPorts = append(rs.HostPorts[:i], rs.HostPorts[i+1:]...)
+					found = true
+					break
+				}
+			}
+			if !found {
+				fmt.Fprintf(os.Stderr, "seki host-port: port %d not configured\n", port)
+				os.Exit(1)
+			}
+			if err := rs.Save(); err != nil {
+				fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
+				os.Exit(1)
+			}
+			paths, _ := socket.SockGlob()
+			for _, p := range paths {
+				if c, err := socket.ConnectPath(p); err == nil {
+					c.Emit(socket.Event{Type: "host_port_remove", Port: port})
+					c.Close()
+				}
+			}
+			fmt.Printf("removed host port %d\n", port)
 		}
-		if !found {
-			fmt.Fprintf(os.Stderr, "seki host-port: port %d not configured\n", port)
-			os.Exit(1)
-		}
-		if err := rs.Save(); err != nil {
-			fmt.Fprintf(os.Stderr, "seki host-port: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("removed host port %d\n", port)
 
 	default:
 		fmt.Fprintf(os.Stderr, "seki host-port: unknown subcommand %q\n", os.Args[2])

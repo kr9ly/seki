@@ -235,11 +235,22 @@ func Exec(args []string) (*Sandbox, error) {
 		if e.Type == "forward" && e.Port > 0 && e.Port <= 65535 {
 			id, err := slirpAddHostFwd(apiSockPath, e.Port)
 			if err != nil {
-				sock.Emit(socket.Event{
-					Type: "forward_error", Port: e.Port,
-					Error: err.Error(),
-				})
+				sock.Emit(socket.Event{Type: "forward_error", Port: e.Port, Error: err.Error()})
 				return
+			}
+			// Persist forward port to rules.json
+			if rs, err := rules.Load(); err == nil {
+				found := false
+				for _, p := range rs.ForwardPorts {
+					if p == e.Port {
+						found = true
+						break
+					}
+				}
+				if !found {
+					rs.ForwardPorts = append(rs.ForwardPorts, e.Port)
+					rs.Save()
+				}
 			}
 			// Tell child to add iptables DNAT for the forwarded port
 			sock.Emit(socket.Event{Type: "dnat", Port: e.Port})
@@ -249,8 +260,60 @@ func Exec(args []string) (*Sandbox, error) {
 			})
 			return
 		}
+		if e.Type == "forward_remove" && e.Port > 0 {
+			if rs, err := rules.Load(); err == nil {
+				for i, p := range rs.ForwardPorts {
+					if p == e.Port {
+						rs.ForwardPorts = append(rs.ForwardPorts[:i], rs.ForwardPorts[i+1:]...)
+						rs.Save()
+						break
+					}
+				}
+			}
+			sock.Emit(socket.Event{Type: "forward_removed", Port: e.Port})
+			return
+		}
+		if e.Type == "host_port_add" && e.Port > 0 {
+			if rs, err := rules.Load(); err == nil {
+				found := false
+				for _, p := range rs.HostPorts {
+					if p == e.Port {
+						found = true
+						break
+					}
+				}
+				if !found {
+					rs.HostPorts = append(rs.HostPorts, e.Port)
+					rs.Save()
+				}
+			}
+			sock.Emit(e)
+			return
+		}
+		if e.Type == "host_port_remove" && e.Port > 0 {
+			if rs, err := rules.Load(); err == nil {
+				for i, p := range rs.HostPorts {
+					if p == e.Port {
+						rs.HostPorts = append(rs.HostPorts[:i], rs.HostPorts[i+1:]...)
+						rs.Save()
+						break
+					}
+				}
+			}
+			sock.Emit(e)
+			return
+		}
 		sock.Emit(e)
 	})
+
+	// Restore persisted forward ports via slirp API
+	if rs, err := rules.Load(); err == nil {
+		for _, port := range rs.ForwardPorts {
+			if _, err := slirpAddHostFwd(apiSockPath, port); err != nil {
+				fmt.Fprintf(os.Stderr, "seki: restore forward port %d: %v\n", port, err)
+			}
+		}
+	}
 
 	// Signal child: slirp4netns is ready, proceed with setup
 	syncPw.Write([]byte{1})
@@ -430,6 +493,16 @@ func ChildSetup() (*ChildState, error) {
 							fmt.Fprintln(os.Stderr, "  (dev server must bind to 0.0.0.0 instead of localhost)")
 						}
 					}
+				case "host_port_add":
+					if e.Port > 0 {
+						fwd, err := startHostForwarder(e.Port)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "seki: host port %d: %v\n", e.Port, err)
+						} else {
+							cs.hostFwds = append(cs.hostFwds, fwd)
+							fmt.Fprintf(os.Stderr, "seki: host port %d started\n", e.Port)
+						}
+					}
 				}
 			}
 		}()
@@ -527,6 +600,13 @@ func ChildSetup() (*ChildState, error) {
 			continue
 		}
 		cs.hostFwds = append(cs.hostFwds, fwd)
+	}
+
+	// Apply DNAT rules for persisted forward ports (host→sandbox)
+	for _, port := range ruleset.ForwardPorts {
+		if err := addPreroutingDNAT(port); err != nil {
+			fmt.Fprintf(os.Stderr, "seki: DNAT for forward port %d: %v\n", port, err)
+		}
 	}
 
 	// Apply iptables rules (all namespace-scoped)

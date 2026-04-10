@@ -36,6 +36,7 @@ type Rule struct {
 type RuleSet struct {
 	Rules        []Rule `json:"rules"`
 	HostPorts    []int  `json:"host_ports,omitempty"`
+	ForwardPorts []int  `json:"forward_ports,omitempty"`
 	LearningMode bool   `json:"learning_mode"`
 }
 
