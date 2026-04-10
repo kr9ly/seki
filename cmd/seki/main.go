@@ -281,6 +281,8 @@ func cmdWatch() {
 		connected[path] = c
 		connMu.Unlock()
 
+		events <- taggedEvent{event: socket.Event{Type: "session_connect", Session: filepath.Base(path)}, client: c}
+
 		go func() {
 			for c.Next() {
 				e, err := c.Event()
@@ -386,8 +388,8 @@ func cmdWatch() {
 					}
 				}
 				if i == 0 {
-					fmt.Printf("\033[%d;1H%s%s — %s[a]%sllow %s[d]%seny%s",
-						row, prefix, label, bold, reset, bold, reset, reset)
+					fmt.Printf("\033[%d;1H%s%s — %s[a]%sllow %s[p]%sass %s[d]%seny%s",
+						row, prefix, label, bold, reset, bold, reset, bold, reset, reset)
 				} else {
 					fmt.Printf("\033[%d;1H%s%s", row, prefix, label)
 				}
@@ -444,6 +446,9 @@ func cmdWatch() {
 			e := te.event
 
 			switch e.Type {
+			case "session_connect":
+				logPrint("%sconnected: %s%s", dim, e.Session, reset)
+
 			case "session_disconnect":
 				// Remove queue items from this session
 				queueMu.Lock()
@@ -593,6 +598,12 @@ func cmdWatch() {
 				} else {
 					first.client.Emit(socket.Event{Type: "approve", Domain: first.domain})
 					saveRule(first.domain, rules.Allow)
+				}
+			case 'p', 'P':
+				if first.command != "" {
+					first.client.Emit(socket.Event{Type: "cmd_approve", Command: first.command})
+				} else {
+					first.client.Emit(socket.Event{Type: "approve", Domain: first.domain})
 				}
 			case 'd', 'D':
 				if first.command != "" {
