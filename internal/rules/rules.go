@@ -133,12 +133,18 @@ func (rs *RuleSet) AddRule(match, action, tag, kind string) {
 	}
 	newRule := Rule{Match: match, Action: action, Tag: tag, Kind: kind}
 	if kind == KindCommand {
-		// Command rules append at end (no catch-all)
 		rs.Rules = append(rs.Rules, newRule)
 	} else {
-		// Network rules insert before the default deny rule (last network rule)
-		if len(rs.Rules) > 0 && rs.Rules[len(rs.Rules)-1].Match == "*" && rs.Rules[len(rs.Rules)-1].Kind != KindCommand {
-			rs.Rules = append(rs.Rules[:len(rs.Rules)-1], newRule, rs.Rules[len(rs.Rules)-1])
+		// Insert before the catch-all deny rule (find it by scanning, not assuming last)
+		insertIdx := -1
+		for i, r := range rs.Rules {
+			if r.Kind != KindCommand && r.Match == "*" && r.Action == Deny {
+				insertIdx = i
+				break
+			}
+		}
+		if insertIdx >= 0 {
+			rs.Rules = append(rs.Rules[:insertIdx], append([]Rule{newRule}, rs.Rules[insertIdx:]...)...)
 		} else {
 			rs.Rules = append(rs.Rules, newRule)
 		}
