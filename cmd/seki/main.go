@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -39,6 +40,8 @@ func main() {
 		cmdWatch()
 	case "mode":
 		cmdMode()
+	case "hook":
+		cmdHook()
 	default:
 		fmt.Fprintf(os.Stderr, "seki: unknown command %q\n", os.Args[1])
 		os.Exit(1)
@@ -89,7 +92,7 @@ func cmdChild() {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), "SEKI_ACTIVE=1")
 
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -497,17 +500,20 @@ func cmdCheck() {
 		os.Exit(1)
 	}
 	cmd := strings.Join(os.Args[2:], " ")
+	checkCommand(cmd)
+}
 
+// checkCommand evaluates a command against rules and blocks if needed.
+// Exits with code 2 if blocked, returns normally if allowed.
+func checkCommand(cmd string) {
 	rs, err := rules.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "seki check: %v\n", err)
-		os.Exit(1)
+		return // fail open
 	}
 
 	res := rs.EvaluateCommand(cmd)
 	switch res.Action {
 	case rules.Allow:
-		// Silent allow
 		return
 	case rules.Deny:
 		tag := ""
@@ -515,25 +521,21 @@ func cmdCheck() {
 			tag = " [" + res.Rule.Tag + "]"
 		}
 		fmt.Fprintf(os.Stderr, "[seki] blocked: %s%s\n", cmd, tag)
-		os.Exit(2) // exit 2 = BLOCK for Claude Code hooks
+		os.Exit(2)
 	case rules.Prompt:
-		// Connect to socket and wait for approval
 		client, err := socket.Connect(false)
 		if err != nil {
-			// No socket = no watch = deny (safe default)
 			fmt.Fprintf(os.Stderr, "[seki] blocked (no watch): %s\n", cmd)
 			os.Exit(2)
 		}
 		defer client.Close()
 
-		// Send command approval request
 		client.Emit(socket.Event{
 			Type:    "cmd_approval",
 			Command: cmd,
 			Action:  "prompt",
 		})
 
-		// Wait for response
 		timeout := time.After(30 * time.Second)
 		events := make(chan socket.Event, 10)
 		go func() {
@@ -557,7 +559,7 @@ func cmdCheck() {
 				if e.Command == cmd {
 					switch e.Type {
 					case "cmd_approve":
-						return // allow
+						return
 					case "cmd_deny":
 						fmt.Fprintf(os.Stderr, "[seki] denied: %s\n", cmd)
 						os.Exit(2)
@@ -615,20 +617,22 @@ func cmdQuery() {
 		}
 	}
 
+	queryBlocked(since, format)
+}
+
+// queryBlocked queries recent blocked events and prints them.
+func queryBlocked(since time.Duration, format string) {
 	log, err := logger.OpenReadOnly()
 	if err != nil {
-		// No database = no events = nothing to report
 		return
 	}
 	defer log.Close()
 
 	entries, err := log.QuerySince(since)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "seki query: %v\n", err)
-		os.Exit(1)
+		return
 	}
 
-	// Filter to non-allow actions
 	var blocked []logger.Entry
 	for _, e := range entries {
 		if e.Action != "" && e.Action != rules.Allow {
@@ -637,11 +641,10 @@ func cmdQuery() {
 	}
 
 	if len(blocked) == 0 {
-		return // nothing to report
+		return
 	}
 
 	if format == "hook" {
-		// Deduplicate by domain+action for concise hook output
 		type key struct{ domain, action string }
 		seen := make(map[key]bool)
 		var lines []string
@@ -671,7 +674,6 @@ func cmdQuery() {
 		return
 	}
 
-	// Default text format
 	for _, e := range blocked {
 		domain := e.Domain
 		if domain == "" {
@@ -679,6 +681,44 @@ func cmdQuery() {
 		}
 		fmt.Printf("%s  %-4s  %-6s  %s\n", e.Time, e.Kind, e.Action, domain)
 	}
+}
+
+func cmdHook() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: seki hook <pre-bash|post-bash>")
+		os.Exit(1)
+	}
+	switch os.Args[2] {
+	case "pre-bash":
+		cmdHookPreBash()
+	case "post-bash":
+		cmdHookPostBash()
+	default:
+		fmt.Fprintf(os.Stderr, "seki hook: unknown hook %q\n", os.Args[2])
+		os.Exit(1)
+	}
+}
+
+func cmdHookPreBash() {
+	if os.Getenv("SEKI_ACTIVE") == "" {
+		return
+	}
+	var input struct {
+		ToolInput struct {
+			Command string `json:"command"`
+		} `json:"tool_input"`
+	}
+	if err := json.NewDecoder(os.Stdin).Decode(&input); err != nil || input.ToolInput.Command == "" {
+		return
+	}
+	checkCommand(input.ToolInput.Command)
+}
+
+func cmdHookPostBash() {
+	if os.Getenv("SEKI_ACTIVE") == "" {
+		return
+	}
+	queryBlocked(5*time.Second, "hook")
 }
 
 // argsAfterSep returns the arguments after "--".
