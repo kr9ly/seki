@@ -437,6 +437,123 @@ seki のルール・ログは子プロセスと同じ uid で動くため、
 ファイルパーミッションだけでは保護できない。
 mount 名前空間で `~/.config/seki/` を read-only bind mount する。
 
+## クレデンシャル隔離
+
+sandbox 内のプロセスから永続的なシークレット（API キー、トークン等）を
+構造的に不可視にする仕組み。ネットワーク隔離が「出口を塞ぐ」のに対し、
+クレデンシャル隔離は「そもそも盗むものがない」状態を作る。
+
+### 背景
+
+現状 `cmd.Env = os.Environ()` で親プロセスの環境変数を全てそのまま渡しているため、
+`ANTHROPIC_API_KEY`, `GH_TOKEN` 等が sandbox 内から読める。
+seki がネットワークを塞いでいるので流出リスクは低いが、
+多層防御の観点から「見えない」方が筋がいい。
+
+参考: [Anthropic Managed Agents](https://www.anthropic.com/engineering/managed-agents) の
+vault+proxy パターン — エージェントの実行環境にクレデンシャルを置かず、
+ツール呼び出し時にプロキシが注入する設計。
+
+### 方式: 環境変数フィルタ + credential-injected exec
+
+2 段構成で実現する。
+
+**1. 環境変数フィルタ（受動的隔離）**
+
+sandbox 起動時に秘密の環境変数を除外する。
+
+```go
+// netns.go — sandbox 作成時
+cmd.Env = filterEnv(os.Environ(), credentials.SecretKeys())
+```
+
+これだけで sandbox 内から credential が「見えない」状態になる。
+ただし `gh`, `curl` 等が credential を必要とするコマンドも動かなくなるため、
+注入側が必要。
+
+**2. credential-injected exec（能動的注入）**
+
+credential が必要なコマンドを seki (host 側) が代理実行する。
+既存のコマンド承認レイヤー + Unix socket を拡張する。
+
+```
+sandbox 内                 Unix socket              host 側 (seki parent)
+──────────                 ───────────              ─────────────────────
+Claude Code
+  → hooks (PreToolUse)
+  → "git push" を検出
+  → seki に credential-exec 要求
+                           ─────────→
+                                                    keychain から GH_TOKEN を取得
+                                                    環境変数に注入して git push を実行
+                                                    結果を返却
+                           ←─────────
+  → 結果を Claude Code に返す
+```
+
+### クレデンシャルマッピング
+
+```jsonc
+// ~/.config/seki/credentials.json
+{
+  "credentials": [
+    {
+      "name": "github",
+      "keychain": "gh-token",       // keychain のエントリ名
+      "inject": "GH_TOKEN",         // 注入先の環境変数名
+      "commands": ["git push", "git fetch", "gh"]  // 対象コマンドパターン
+    },
+    {
+      "name": "anthropic",
+      "keychain": "anthropic-api-key",
+      "inject": "ANTHROPIC_API_KEY",
+      "commands": ["*"]             // 全コマンドに注入（API 呼び出しはどこからでも起きうる）
+    }
+  ]
+}
+```
+
+### socket プロトコル拡張
+
+既存の `socket.Event` に新しいメッセージ型を追加する。
+
+```
+→ { "type": "credential_exec", "command": "git push origin main", "env": [...] }
+← { "type": "credential_exec_result", "exit_code": 0, "stdout": "...", "stderr": "..." }
+```
+
+host 側のハンドラ:
+1. `command` が `credentials.json` のどのエントリにマッチするか判定
+2. マッチした keychain エントリからシークレットを読み出し
+3. フィルタ済み env + 注入された credential で command を exec
+4. 終了コード + stdout/stderr を返却
+
+### セキュリティモデル
+
+| 状態 | sandbox 内 | host 側 |
+|------|-----------|---------|
+| 環境変数 | フィルタ済み（秘密なし） | 全て保持 |
+| keychain アクセス | 不要（socket 経由で委譲） | 読み出し可 |
+| credential の寿命 | 存在しない | exec 中のみメモリ上 |
+
+三重防御:
+1. **見えない** — 環境変数フィルタで sandbox 内に credential が存在しない
+2. **出せない** — ネットワーク隔離で外部送信が不可能
+3. **使えない** — credential-injected exec は承認キューと統合可能（prompt アクション）
+
+### コマンド承認との統合
+
+credential-injected exec は既存のコマンド承認レイヤーと自然に合流する。
+
+| 操作 | 承認 | credential |
+|------|------|-----------|
+| `git push` | prompt (承認キュー) | GH_TOKEN 注入 |
+| `npm publish` | prompt | NPM_TOKEN 注入 |
+| `curl api.example.com` | allow (ルール次第) | 注入なし |
+
+承認と credential 注入を同じフローで処理できるため、
+「承認された操作だけに credential が渡る」という原則が自然に成立する。
+
 ## 実装状況
 
 言語: **Go** (ネットワーク操作、バイナリ配布、既存ツールとの一貫性)
@@ -463,6 +580,9 @@ mount 名前空間で `~/.config/seki/` を read-only bind mount する。
 - [ ] メタデータ read-only bind mount
 - [ ] 起動時パーミッションチェック
 - [ ] ルール自動提案 (`seki log --suggest` 的な)
+- [ ] 環境変数フィルタ (sandbox 起動時に秘密の環境変数を除外)
+- [ ] credential-injected exec (socket 経由の代理実行 + keychain 読み出し)
+- [ ] credentials.json (クレデンシャルマッピング設定)
 
 ## 確定済み設計判断
 
@@ -479,3 +599,5 @@ mount 名前空間で `~/.config/seki/` を read-only bind mount する。
 - 承認は手続き単位 (ドメイン単位ではなく「git push」のような操作単位)
 - 2レイヤーモデル: ネットワーク (ホワイトリスト) + コマンド承認 (ブラックリスト)
 - stderr 出力は抑制し、ログは SQLite + watch socket に集約
+- クレデンシャル隔離: 環境変数フィルタ + credential-injected exec (vault+proxy パターン)
+- 承認された操作だけに credential が渡る (承認キューとの統合)
