@@ -35,7 +35,8 @@ type Event struct {
 	// Port forwarding
 	Port      int    `json:"port,omitempty"`
 	ForwardID int    `json:"forward_id,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Message string `json:"message,omitempty"` // free-form log message (for emit events)
 }
 
 // MessageFunc is called when a message is received from a watch client.

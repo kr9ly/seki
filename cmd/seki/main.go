@@ -51,6 +51,8 @@ func main() {
 		cmdHook()
 	case "credential":
 		cmdCredential()
+	case "emit":
+		cmdEmit()
 	case "forward":
 		cmdForward()
 	case "host-port":
@@ -449,6 +451,9 @@ func cmdWatch() {
 			case "session_connect":
 				logPrint("%sconnected: %s%s", dim, e.Session, reset)
 
+			case "emit":
+				logPrint("%s» %s%s", dim, e.Message, reset)
+
 			case "session_disconnect":
 				// Remove queue items from this session
 				queueMu.Lock()
@@ -614,6 +619,31 @@ func cmdWatch() {
 				}
 			}
 		}
+	}
+}
+
+func cmdEmit() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: seki emit <message>")
+		os.Exit(1)
+	}
+	msg := strings.Join(os.Args[2:], " ")
+	const maxLen = 200
+	if len(msg) > maxLen {
+		msg = msg[:maxLen] + "…"
+	}
+
+	paths, err := socket.SockGlob()
+	if err != nil || len(paths) == 0 {
+		return // no active sessions, silently exit
+	}
+	for _, p := range paths {
+		c, err := socket.ConnectPath(p)
+		if err != nil {
+			continue
+		}
+		c.Emit(socket.Event{Type: "emit", Message: msg})
+		c.Close()
 	}
 }
 
