@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,7 +26,7 @@ import (
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: seki <command> [args...]")
-		fmt.Fprintln(os.Stderr, "commands: exec, log, rules, check, query, watch, mode, credential")
+		fmt.Fprintln(os.Stderr, "commands: exec, log, rules, check, query, watch, mode, credential, forward")
 		os.Exit(1)
 	}
 
@@ -50,6 +51,8 @@ func main() {
 		cmdHook()
 	case "credential":
 		cmdCredential()
+	case "forward":
+		cmdForward()
 	default:
 		fmt.Fprintf(os.Stderr, "seki: unknown command %q\n", os.Args[1])
 		os.Exit(1)
@@ -1021,4 +1024,162 @@ func enableRawMode() (*unix.Termios, error) {
 // restoreTerminal restores the terminal to its previous state.
 func restoreTerminal(state *unix.Termios) {
 	unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TCSETS, state)
+}
+
+// cmdForward sets up port forwarding from the host into the seki sandbox.
+// Must be run inside the sandbox (SEKI_SLIRP_API must be set).
+func cmdForward() {
+	apiSock := os.Getenv("SEKI_SLIRP_API")
+	if apiSock == "" {
+		fmt.Fprintln(os.Stderr, "seki forward: not running inside seki sandbox (SEKI_SLIRP_API not set)")
+		os.Exit(1)
+	}
+
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: seki forward <port>")
+		fmt.Fprintln(os.Stderr, "       seki forward --list")
+		os.Exit(1)
+	}
+
+	switch os.Args[2] {
+	case "--list":
+		entries, err := slirpListHostFwd(apiSock)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki forward: %v\n", err)
+			os.Exit(1)
+		}
+		if len(entries) == 0 {
+			fmt.Println("no active port forwards")
+			return
+		}
+		for _, e := range entries {
+			fmt.Printf("id=%d  %s  host=%s:%d → guest=%s:%d\n",
+				e.ID, e.Proto, e.HostAddr, e.HostPort, e.GuestAddr, e.GuestPort)
+		}
+	default:
+		port, err := strconv.Atoi(os.Args[2])
+		if err != nil || port < 1 || port > 65535 {
+			fmt.Fprintf(os.Stderr, "seki forward: invalid port: %s\n", os.Args[2])
+			os.Exit(1)
+		}
+
+		id, err := slirpAddHostFwd(apiSock, port, port)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki forward: %v\n", err)
+			os.Exit(1)
+		}
+
+		// DNAT so that traffic arriving on tap0 reaches localhost-bound servers
+		if err := addPreroutingDNAT(port); err != nil {
+			fmt.Fprintf(os.Stderr, "seki forward: warning: iptables DNAT failed: %v\n", err)
+			fmt.Fprintln(os.Stderr, "  (dev server must bind to 0.0.0.0 instead of localhost)")
+		}
+
+		fmt.Printf("forwarding port %d (id=%d) — accessible at localhost:%d\n", port, id, port)
+	}
+}
+
+// slirpAddHostFwd adds a TCP host-to-guest port forward via the slirp4netns API.
+func slirpAddHostFwd(apiSock string, hostPort, guestPort int) (int, error) {
+	req := map[string]interface{}{
+		"execute": "add_hostfwd",
+		"arguments": map[string]interface{}{
+			"proto":      "tcp",
+			"host_addr":  "0.0.0.0",
+			"host_port":  hostPort,
+			"guest_addr": netns.SlirpGuestIP,
+			"guest_port": guestPort,
+		},
+	}
+	resp, err := slirpAPICall(apiSock, req)
+	if err != nil {
+		return 0, err
+	}
+	ret, ok := resp["return"].(map[string]interface{})
+	if !ok {
+		return 0, fmt.Errorf("unexpected response: %v", resp)
+	}
+	id, _ := ret["id"].(float64)
+	return int(id), nil
+}
+
+type hostFwdEntry struct {
+	ID        int    `json:"id"`
+	Proto     string `json:"proto"`
+	HostAddr  string `json:"host_addr"`
+	HostPort  int    `json:"host_port"`
+	GuestAddr string `json:"guest_addr"`
+	GuestPort int    `json:"guest_port"`
+}
+
+// slirpListHostFwd lists active host-to-guest port forwards.
+func slirpListHostFwd(apiSock string) ([]hostFwdEntry, error) {
+	req := map[string]interface{}{"execute": "list_hostfwd"}
+	resp, err := slirpAPICall(apiSock, req)
+	if err != nil {
+		return nil, err
+	}
+	ret, ok := resp["return"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response: %v", resp)
+	}
+	entriesRaw, ok := ret["entries"].([]interface{})
+	if !ok {
+		return nil, nil
+	}
+	var entries []hostFwdEntry
+	for _, raw := range entriesRaw {
+		data, _ := json.Marshal(raw)
+		var e hostFwdEntry
+		json.Unmarshal(data, &e)
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+// slirpAPICall sends a JSON request to the slirp4netns API socket and returns the response.
+func slirpAPICall(apiSock string, req map[string]interface{}) (map[string]interface{}, error) {
+	conn, err := net.Dial("unix", apiSock)
+	if err != nil {
+		return nil, fmt.Errorf("connect to slirp4netns API: %w", err)
+	}
+	defer conn.Close()
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Write(data); err != nil {
+		return nil, fmt.Errorf("write request: %w", err)
+	}
+	// slirp4netns requires shutdown(SHUT_WR) after sending
+	if uc, ok := conn.(*net.UnixConn); ok {
+		uc.CloseWrite()
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if errObj, ok := resp["error"].(map[string]interface{}); ok {
+		desc, _ := errObj["desc"].(string)
+		return nil, fmt.Errorf("%s", desc)
+	}
+	return resp, nil
+}
+
+// addPreroutingDNAT adds an iptables PREROUTING rule so that traffic from tap0
+// is redirected to localhost, allowing forwarding to reach localhost-bound servers.
+func addPreroutingDNAT(port int) error {
+	p := strconv.Itoa(port)
+	dest := "127.0.0.1:" + p
+	// Check if rule already exists (idempotent)
+	if err := exec.Command("iptables", "-t", "nat", "-C", "PREROUTING",
+		"-i", "tap0", "-p", "tcp", "--dport", p,
+		"-j", "DNAT", "--to-destination", dest).Run(); err == nil {
+		return nil // already exists
+	}
+	return exec.Command("iptables", "-t", "nat", "-A", "PREROUTING",
+		"-i", "tap0", "-p", "tcp", "--dport", p,
+		"-j", "DNAT", "--to-destination", dest).Run()
 }

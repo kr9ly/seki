@@ -24,7 +24,8 @@ const (
 	ProxyPort = "10200"
 	DNSPort   = "5353"
 	// slirp4netns defaults
-	SlirpDNS = "10.0.2.3"
+	SlirpDNS     = "10.0.2.3"
+	SlirpGuestIP = "10.0.2.100"
 )
 
 // Sandbox holds the state of an isolated network namespace.
@@ -55,6 +56,14 @@ func Exec(args []string) (*Sandbox, error) {
 	os.Setenv("SEKI_SOCK", sockName)
 	credSockName := fmt.Sprintf("seki-cred-%d.sock", os.Getpid())
 	os.Setenv("SEKI_CRED_SOCK", credSockName)
+
+	// slirp4netns API socket for port forwarding
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("user home: %w", err)
+	}
+	apiSockPath := filepath.Join(home, ".config", "seki", fmt.Sprintf("slirp-api-%d.sock", os.Getpid()))
+	os.Setenv("SEKI_SLIRP_API", apiSockPath)
 
 	// Pass caller's cwd so watch can display which project a session belongs to
 	if cwd, err := os.Getwd(); err == nil {
@@ -154,6 +163,7 @@ func Exec(args []string) (*Sandbox, error) {
 	slirpCmd := exec.Command("slirp4netns",
 		"--configure",
 		"--mtu", "65520",
+		"--api-socket", apiSockPath,
 		"-r", "3", // ready fd
 		"-e", "4", // exit fd
 		fmt.Sprintf("%d", cmd.Process.Pid),
@@ -186,6 +196,9 @@ func Exec(args []string) (*Sandbox, error) {
 		return nil, fmt.Errorf("wait for slirp4netns: %w", err)
 	}
 	readyPr.Close()
+
+	// Clean up slirp4netns API socket on exit
+	sb.cleanup = append(sb.cleanup, func() { os.Remove(apiSockPath) })
 
 	// Start Unix socket server for watch clients
 	sock, err := socket.NewServer()
