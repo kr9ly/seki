@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -67,8 +68,9 @@ func Load() (*RuleSet, error) {
 	return &rs, nil
 }
 
-// Save writes the rule set to disk.
+// Save normalizes (sort + merge) and writes the rule set to disk.
 func (rs *RuleSet) Save() error {
+	rs.normalize()
 	path, err := rulesPath()
 	if err != nil {
 		return err
@@ -78,6 +80,76 @@ func (rs *RuleSet) Save() error {
 		return err
 	}
 	return os.WriteFile(path, data, 0644)
+}
+
+// normalize sorts network rules by specificity and merges redundant rules.
+func (rs *RuleSet) normalize() {
+	var network, command []Rule
+	for _, r := range rs.Rules {
+		if r.Kind == KindCommand {
+			command = append(command, r)
+		} else {
+			network = append(network, r)
+		}
+	}
+
+	sort.SliceStable(network, func(i, j int) bool {
+		si, sj := ruleSpecificity(network[i]), ruleSpecificity(network[j])
+		if si != sj {
+			return si > sj
+		}
+		return network[i].Match < network[j].Match
+	})
+
+	network = mergeRedundant(network)
+	rs.Rules = append(network, command...)
+}
+
+// ruleSpecificity returns a numeric score (higher = more specific).
+func ruleSpecificity(r Rule) int {
+	if r.Match == "*" {
+		return 0
+	}
+	if isCIDR(r.Match) {
+		_, cidr, _ := net.ParseCIDR(r.Match)
+		ones, _ := cidr.Mask.Size()
+		return 10 + ones
+	}
+	if strings.HasPrefix(r.Match, "*.") {
+		return 200
+	}
+	return 300 // exact domain
+}
+
+// mergeRedundant removes exact domain rules covered by a wildcard with the same action and tag.
+func mergeRedundant(rules []Rule) []Rule {
+	var wildcards []Rule
+	for _, r := range rules {
+		if strings.HasPrefix(r.Match, "*.") {
+			wildcards = append(wildcards, r)
+		}
+	}
+	if len(wildcards) == 0 {
+		return rules
+	}
+
+	var result []Rule
+	for _, r := range rules {
+		if r.Match != "*" && !isCIDR(r.Match) && !strings.HasPrefix(r.Match, "*.") {
+			covered := false
+			for _, w := range wildcards {
+				if w.Action == r.Action && w.Tag == r.Tag && matchGlob(w.Match, r.Match) {
+					covered = true
+					break
+				}
+			}
+			if covered {
+				continue
+			}
+		}
+		result = append(result, r)
+	}
+	return result
 }
 
 // Evaluate checks a domain and/or IP against network rules.
@@ -122,7 +194,7 @@ func (rs *RuleSet) EvaluateCommand(cmd string) Result {
 	return Result{Action: Allow}
 }
 
-// AddRule appends a rule. If a rule with the same match and kind already exists, it's updated.
+// AddRule appends or updates a rule. Ordering is handled by Save.
 func (rs *RuleSet) AddRule(match, action, tag, kind string) {
 	for i, r := range rs.Rules {
 		if r.Match == match && r.Kind == kind {
@@ -131,24 +203,7 @@ func (rs *RuleSet) AddRule(match, action, tag, kind string) {
 			return
 		}
 	}
-	newRule := Rule{Match: match, Action: action, Tag: tag, Kind: kind}
-	if kind == KindCommand {
-		rs.Rules = append(rs.Rules, newRule)
-	} else {
-		// Insert before the catch-all deny rule (find it by scanning, not assuming last)
-		insertIdx := -1
-		for i, r := range rs.Rules {
-			if r.Kind != KindCommand && r.Match == "*" && r.Action == Deny {
-				insertIdx = i
-				break
-			}
-		}
-		if insertIdx >= 0 {
-			rs.Rules = append(rs.Rules[:insertIdx], append([]Rule{newRule}, rs.Rules[insertIdx:]...)...)
-		} else {
-			rs.Rules = append(rs.Rules, newRule)
-		}
-	}
+	rs.Rules = append(rs.Rules, Rule{Match: match, Action: action, Tag: tag, Kind: kind})
 }
 
 // RemoveRule removes a rule by match pattern.
