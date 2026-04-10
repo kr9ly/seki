@@ -5,16 +5,19 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/kr9ly/seki/internal/approval"
+	"github.com/kr9ly/seki/internal/credential"
 	sekidns "github.com/kr9ly/seki/internal/dns"
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/proxy"
 	"github.com/kr9ly/seki/internal/rules"
 	"github.com/kr9ly/seki/internal/socket"
+	"github.com/kr9ly/seki/internal/sshagent"
 )
 
 const (
@@ -50,6 +53,8 @@ func Exec(args []string) (*Sandbox, error) {
 	// Set per-session socket name so multiple seki exec can coexist
 	sockName := fmt.Sprintf("seki-%d.sock", os.Getpid())
 	os.Setenv("SEKI_SOCK", sockName)
+	credSockName := fmt.Sprintf("seki-cred-%d.sock", os.Getpid())
+	os.Setenv("SEKI_CRED_SOCK", credSockName)
 
 	// Sync pipe: parent writes after slirp4netns is ready
 	syncPr, syncPw, err := os.Pipe()
@@ -66,13 +71,44 @@ func Exec(args []string) (*Sandbox, error) {
 	}
 	sb.exitPw = exitPw
 
+	// Start credential socket server before cmd.Start() so the path is
+	// known when we build cmd.Env below.
+	credCfg, err := credential.LoadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki: credential config: %v\n", err)
+	} else if len(credCfg.Credentials) > 0 {
+		hostEnv := envToMap(os.Environ())
+		credSrv, err := credential.NewServer(credCfg, hostEnv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki: credential server: %v\n", err)
+		} else {
+			sb.cleanup = append(sb.cleanup, func() { credSrv.Close() })
+		}
+	}
+
+	// Start SSH agent proxy if host has ssh-agent running. This also runs
+	// before cmd.Start() so the socket path is available for cmd.Env.
+	var sshProxyPath string
+	if hostSSHAuth := os.Getenv("SSH_AUTH_SOCK"); hostSSHAuth != "" {
+		home, _ := os.UserHomeDir()
+		sshProxyPath = filepath.Join(home, ".config", "seki",
+			fmt.Sprintf("seki-ssh-%d.sock", os.Getpid()))
+		sshProxy, err := sshagent.NewProxy(sshProxyPath, hostSSHAuth)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki: ssh agent proxy: %v\n", err)
+			sshProxyPath = "" // fallback: no proxy
+		} else {
+			sb.cleanup = append(sb.cleanup, func() { sshProxy.Close() })
+		}
+	}
+
 	// Re-exec as __child in new user+network+mount namespaces
 	childArgs := append([]string{"__child", "--"}, args...)
 	cmd := exec.Command(self, childArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
+	cmd.Env = buildChildEnv(self, sshProxyPath)
 	cmd.ExtraFiles = []*os.File{syncPr} // fd 3
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET | syscall.CLONE_NEWNS,
@@ -451,9 +487,10 @@ func overrideResolvConf() error {
 	return nil
 }
 
-// bindSSH bind-mounts the user's ~/.ssh to /root/.ssh.
+// bindSSH copies SSH config and known_hosts to /root/.ssh inside the namespace.
 // Inside the user namespace uid is mapped to 0, so SSH looks for /root/.ssh
-// via getpwuid(0) instead of HOME.
+// via getpwuid(0) instead of HOME. Private keys are intentionally NOT copied;
+// authentication is handled by the SSH agent proxy running on the host.
 func bindSSH() error {
 	home := os.Getenv("HOME")
 	if home == "" {
@@ -463,14 +500,27 @@ func bindSSH() error {
 	if _, err := os.Stat(sshDir); err != nil {
 		return nil
 	}
-	// /root is owned by real root — mount tmpfs over it so we can write
+	// /root is owned by real root — mount tmpfs so we can write under our uid mapping
 	if err := syscall.Mount("tmpfs", "/root", "tmpfs", 0, "size=1m"); err != nil {
 		return fmt.Errorf("tmpfs /root: %w", err)
 	}
 	if err := os.MkdirAll("/root/.ssh", 0700); err != nil {
 		return fmt.Errorf("mkdir /root/.ssh: %w", err)
 	}
-	return syscall.Mount(sshDir, "/root/.ssh", "", syscall.MS_BIND|syscall.MS_REC, "")
+
+	// Copy only config and known_hosts — NOT private keys
+	for _, name := range []string{"config", "known_hosts"} {
+		src := filepath.Join(sshDir, name)
+		data, err := os.ReadFile(src)
+		if err != nil {
+			continue // file doesn't exist, skip
+		}
+		dst := filepath.Join("/root/.ssh", name)
+		if err := os.WriteFile(dst, data, 0600); err != nil {
+			return fmt.Errorf("copy %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 func run(name string, args ...string) error {
@@ -479,4 +529,45 @@ func run(name string, args ...string) error {
 		return fmt.Errorf("%s %s: %s: %w", name, strings.Join(args, " "), strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+// buildChildEnv constructs the environment for the child process.
+// It injects git credential helper config and filters conflicting GIT_CONFIG_* vars.
+// If sshProxyPath is non-empty, SSH_AUTH_SOCK is replaced with the proxy socket path.
+func buildChildEnv(sekiBin string, sshProxyPath string) []string {
+	env := os.Environ()
+	// Filter existing GIT_CONFIG_* to avoid conflicts.
+	// Also filter SSH_AUTH_SOCK when a proxy is active (will be re-added below).
+	filtered := make([]string, 0, len(env)+4)
+	for _, e := range env {
+		if strings.HasPrefix(e, "GIT_CONFIG_COUNT=") ||
+			strings.HasPrefix(e, "GIT_CONFIG_KEY_") ||
+			strings.HasPrefix(e, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		if sshProxyPath != "" && strings.HasPrefix(e, "SSH_AUTH_SOCK=") {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	filtered = append(filtered,
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=credential.helper",
+		fmt.Sprintf("GIT_CONFIG_VALUE_0=!%s credential", sekiBin),
+	)
+	if sshProxyPath != "" {
+		filtered = append(filtered, "SSH_AUTH_SOCK="+sshProxyPath)
+	}
+	return filtered
+}
+
+// envToMap converts os.Environ() slice to a map.
+func envToMap(environ []string) map[string]string {
+	m := make(map[string]string, len(environ))
+	for _, e := range environ {
+		if k, v, ok := strings.Cut(e, "="); ok {
+			m[k] = v
+		}
+	}
+	return m
 }

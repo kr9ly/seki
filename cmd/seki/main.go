@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -11,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kr9ly/seki/internal/credential"
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/netns"
 	"github.com/kr9ly/seki/internal/rules"
@@ -21,7 +24,7 @@ import (
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: seki <command> [args...]")
-		fmt.Fprintln(os.Stderr, "commands: exec, log, rules, check, query, watch, mode")
+		fmt.Fprintln(os.Stderr, "commands: exec, log, rules, check, query, watch, mode, credential")
 		os.Exit(1)
 	}
 
@@ -44,6 +47,8 @@ func main() {
 		cmdMode()
 	case "hook":
 		cmdHook()
+	case "credential":
+		cmdCredential()
 	default:
 		fmt.Fprintf(os.Stderr, "seki: unknown command %q\n", os.Args[1])
 		os.Exit(1)
@@ -902,6 +907,78 @@ func cmdHookPostBash() {
 		return
 	}
 	queryBlocked(5*time.Second, "hook")
+}
+
+func cmdCredential() {
+	// os.Args[2] is the git credential subcommand: get, store, erase
+	// Only "get" needs implementation; store/erase are no-ops.
+	if len(os.Args) < 3 || os.Args[2] != "get" {
+		return
+	}
+
+	// Read git credential protocol from stdin (key=value lines, blank line terminates)
+	var protocol, host string
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			break
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			switch k {
+			case "protocol":
+				protocol = v
+			case "host":
+				host = v
+			}
+		}
+	}
+
+	if host == "" {
+		return
+	}
+
+	// Connect to the parent's credential socket server
+	sockPath, err := credential.SockPath()
+	if err != nil {
+		return
+	}
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	// Send request
+	req := credential.Request{Action: "get", Protocol: protocol, Host: host}
+	data, err := json.Marshal(req)
+	if err != nil {
+		return
+	}
+	data = append(data, '\n')
+	if _, err := conn.Write(data); err != nil {
+		return
+	}
+
+	// Read response
+	respScanner := bufio.NewScanner(conn)
+	if !respScanner.Scan() {
+		return
+	}
+	var resp credential.Response
+	if err := json.Unmarshal(respScanner.Bytes(), &resp); err != nil {
+		return
+	}
+	if resp.Error != "" || resp.Username == "" {
+		return
+	}
+
+	// Output git credential protocol
+	fmt.Printf("protocol=%s\n", protocol)
+	fmt.Printf("host=%s\n", host)
+	fmt.Printf("username=%s\n", resp.Username)
+	fmt.Printf("password=%s\n", resp.Password)
+	fmt.Println()
 }
 
 // argsAfterSep returns the arguments after "--".
