@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -242,6 +243,11 @@ func SockGlob() ([]string, error) {
 
 	var alive []string
 	for _, path := range matches {
+		// Skip non-event sockets (credential, SSH agent)
+		base := filepath.Base(path)
+		if strings.HasPrefix(base, "seki-cred-") || strings.HasPrefix(base, "seki-ssh-") {
+			continue
+		}
 		conn, err := net.Dial("unix", path)
 		if err != nil {
 			os.Remove(path) // stale socket
