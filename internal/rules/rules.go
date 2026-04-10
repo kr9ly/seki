@@ -242,6 +242,11 @@ func DefaultRuleSet() *RuleSet {
 }
 
 func matchRule(pattern, domain, ip string) bool {
+	// Catch-all matches everything
+	if pattern == "*" {
+		return true
+	}
+
 	// Try CIDR match on IP
 	if ip != "" && isCIDR(pattern) {
 		_, cidr, err := net.ParseCIDR(pattern)
