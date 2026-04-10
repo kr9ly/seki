@@ -147,6 +147,14 @@ iptables -t nat -A OUTPUT -p tcp -j REDIRECT --to-ports 10200
 iptables -A OUTPUT -p udp -m mark --mark 0x1 -j ACCEPT
 iptables -A OUTPUT -p udp -d 127.0.0.0/8 -j ACCEPT
 iptables -A OUTPUT -p udp -j DROP
+
+# ICMP: 全 DROP (ICMP トンネリング防止、seki は ICMP を使わない)
+iptables -A OUTPUT -p icmp -j DROP
+
+# IPv6: loopback のみ許可、他は DROP (seki のサービスは IPv4 only)
+ip6tables -A OUTPUT -m mark --mark 0x1 -j ACCEPT
+ip6tables -A OUTPUT -d ::1/128 -j ACCEPT
+ip6tables -A OUTPUT -j DROP
 ```
 
 ### ホスト安全性保証
@@ -437,6 +445,41 @@ seki のルール・ログは子プロセスと同じ uid で動くため、
 ファイルパーミッションだけでは保護できない。
 mount 名前空間で `~/.config/seki/` を read-only bind mount する。
 
+## ソケット信頼検証
+
+seki の Unix socket はイベントの送受信に使われる。sandbox 内のプロセスも
+この socket に接続できるため、承認イベント（approve/deny）の送信元を検証する。
+
+### 方式: user namespace による接続元識別
+
+接続時に `SO_PEERCRED` でピアの PID を取得し、`/proc/<pid>/ns/user` を
+ホストの user namespace と比較する。
+
+| 接続元 | user namespace | 信頼レベル |
+|--------|---------------|-----------|
+| watch | ホスト NS | trusted — 制御イベント送信可 |
+| child (seki 内部) | sandbox NS | untrusted — 制御イベントはドロップ |
+| sandbox プロセス | sandbox NS (またはその子孫) | untrusted — 制御イベントはドロップ |
+
+**制御イベント**: `approve`, `deny`, `cmd_approve`, `cmd_deny`
+**非制御イベント**: `dns`, `tcp`, `status`, `dnat`, `forward` 等 — 信頼レベル不問
+
+### なぜ user namespace 比較が堅牢か
+
+- sandbox は常に child user namespace にいる（ホスト NS と異なる inode）
+- `unshare(CLONE_NEWUSER)` で新 NS を作っても descendant であり、ホスト NS にはなれない
+- `setns()` でホスト NS に入るには `CAP_SYS_ADMIN` in ホスト NS が必要 → sandbox から不可能
+- fail-closed: SO_PEERCRED や /proc 読み取り失敗時は untrusted 扱い
+
+## slirp4netns API 保護
+
+slirp4netns の API socket はポートフォワード等の操作に使われる。
+sandbox から直接アクセスされると意図しないサービス公開が可能なため、保護する。
+
+- ChildSetup で API socket に `/dev/null` を bind mount して隠蔽
+- 環境変数 `SEKI_SLIRP_API` を sandbox env からフィルタ
+- ポートフォワードは seki parent socket 経由でプロキシ（parent が slirp API を呼ぶ）
+
 ## クレデンシャル隔離
 
 sandbox 内のプロセスから永続的なシークレット（API キー、トークン等）を
@@ -629,6 +672,10 @@ credential helper proxy 完成後にこの bind-mount は削除する。
 - [x] .ssh コピーベース配置 (config + known_hosts のみ、秘密鍵なし)
 - [x] 環境変数フィルタ (sandbox 起動時に SecretKeys() 参照の環境変数を除外)
 - [x] ~/.config/seki/ read-only bind mount (ルール・設定の改ざん防止)
+- [x] ソケット信頼検証 (SO_PEERCRED + user namespace 比較で sandbox からの approve をドロップ)
+- [x] ICMP DROP (ICMP トンネリング防止)
+- [x] ip6tables (IPv6 トラフィックを loopback 以外全 DROP)
+- [x] slirp API 保護 (/dev/null bind mount + parent プロキシ経由でポートフォワード)
 
 ### 未実装
 - [ ] ECH 除去 (HTTPS/SVCB レコードから ECH 設定を除去)
@@ -653,3 +700,6 @@ credential helper proxy 完成後にこの bind-mount は削除する。
 - クレデンシャル隔離: 環境変数フィルタ + credential helper proxy (代理実行ではなく credential だけ注入)
 - 承認された操作だけに credential が渡る (承認キューとの統合)
 - SSH は agent proxy で署名転送 (秘密鍵は sandbox に入らない)
+- ソケット信頼: user namespace 比較で接続元を識別 (sandbox からの制御イベントをドロップ)
+- ICMP/IPv6: 全 DROP (seki のサービスは TCP+UDP over IPv4 のみ)
+- slirp API: sandbox から隠蔽、ポートフォワードは parent プロキシ経由
