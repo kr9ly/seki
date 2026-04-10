@@ -407,16 +407,28 @@ func cmdWatch() {
 					client.Emit(socket.Event{Type: "cmd_approve", Command: first.command})
 				} else {
 					client.Emit(socket.Event{Type: "approve", Domain: first.domain})
+					saveRule(first.domain, rules.Allow)
 				}
 			case 'd', 'D':
 				if first.command != "" {
 					client.Emit(socket.Event{Type: "cmd_deny", Command: first.command})
 				} else {
 					client.Emit(socket.Event{Type: "deny", Domain: first.domain})
+					saveRule(first.domain, rules.Deny)
 				}
 			}
 		}
 	}
+}
+
+// saveRule persists an allow/deny decision as a rule.
+func saveRule(domain, action string) {
+	rs, err := rules.Load()
+	if err != nil {
+		return
+	}
+	rs.AddRule(domain, action, "", rules.KindNetwork)
+	rs.Save()
 }
 
 func cmdRules() {
