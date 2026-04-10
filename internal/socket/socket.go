@@ -160,6 +160,7 @@ func Connect(wait bool) (*Client, error) {
 		return nil, err
 	}
 
+	printed := false
 	for {
 		conn, err := net.Dial("unix", path)
 		if err == nil {
@@ -168,7 +169,10 @@ func Connect(wait bool) (*Client, error) {
 		if !wait {
 			return nil, fmt.Errorf("connect %s: %w (is seki exec running?)", path, err)
 		}
-		fmt.Fprintf(os.Stderr, "waiting for seki exec...\n")
+		if !printed {
+			fmt.Fprintf(os.Stderr, "waiting for seki exec...\n")
+			printed = true
+		}
 		time.Sleep(1 * time.Second)
 	}
 }
