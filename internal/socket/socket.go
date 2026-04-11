@@ -34,6 +34,7 @@ type Event struct {
 	QueueSize int `json:"queue_size,omitempty"`
 	// Port forwarding
 	Port      int    `json:"port,omitempty"`
+	HostPort  int    `json:"host_port,omitempty"`
 	ForwardID int    `json:"forward_id,omitempty"`
 	Error   string `json:"error,omitempty"`
 	Message string `json:"message,omitempty"` // free-form log message (for emit events)

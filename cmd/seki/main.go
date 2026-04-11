@@ -1106,131 +1106,57 @@ func restoreTerminal(state *unix.Termios) {
 }
 
 // cmdForward sets up port forwarding from the host into the seki sandbox.
-// Must be run inside the sandbox (SEKI_SLIRP_API must be set).
 func cmdForward() {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: seki forward <port>")
-		fmt.Fprintln(os.Stderr, "       seki forward --remove <port>")
-		fmt.Fprintln(os.Stderr, "       seki forward --list")
 		os.Exit(1)
 	}
 
-	switch os.Args[2] {
-	case "--remove":
-		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "usage: seki forward --remove <port>")
-			os.Exit(1)
-		}
-		port, err := strconv.Atoi(os.Args[3])
-		if err != nil || port < 1 || port > 65535 {
-			fmt.Fprintf(os.Stderr, "seki forward: invalid port: %s\n", os.Args[3])
-			os.Exit(1)
-		}
-		sock, err := socket.Connect(false)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "seki forward: %v\n", err)
-			os.Exit(1)
-		}
-		defer sock.Close()
-		sock.Emit(socket.Event{Type: "forward_remove", Port: port})
-		deadline := time.After(5 * time.Second)
-		for {
-			done := make(chan struct{})
-			var e socket.Event
-			var ok bool
-			go func() {
-				ok = sock.Next()
-				if ok {
-					e, _ = sock.Event()
-				}
-				close(done)
-			}()
-			select {
-			case <-done:
-				if !ok {
-					fmt.Fprintln(os.Stderr, "seki forward: connection closed")
-					os.Exit(1)
-				}
-				if e.Type == "forward_removed" && e.Port == port {
-					fmt.Printf("removed forward port %d (effective on next restart)\n", port)
-					return
-				}
-			case <-deadline:
-				fmt.Fprintln(os.Stderr, "seki forward: timeout")
+	port, err := strconv.Atoi(os.Args[2])
+	if err != nil || port < 1 || port > 65535 {
+		fmt.Fprintf(os.Stderr, "seki forward: invalid port: %s\n", os.Args[2])
+		os.Exit(1)
+	}
+
+	sock, err := socket.Connect(false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki forward: %v\n", err)
+		os.Exit(1)
+	}
+	defer sock.Close()
+
+	sock.Emit(socket.Event{Type: "forward", Port: port})
+
+	deadline := time.After(5 * time.Second)
+	for {
+		done := make(chan struct{})
+		var e socket.Event
+		var ok bool
+		go func() {
+			ok = sock.Next()
+			if ok {
+				e, _ = sock.Event()
+			}
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			if !ok {
+				fmt.Fprintln(os.Stderr, "seki forward: connection closed")
 				os.Exit(1)
 			}
-		}
-	case "--list":
-		// --list requires direct slirp API access (run from outside sandbox)
-		apiSock := os.Getenv("SEKI_SLIRP_API")
-		if apiSock == "" {
-			fmt.Fprintln(os.Stderr, "seki forward --list: SEKI_SLIRP_API not set (run from outside sandbox)")
-			os.Exit(1)
-		}
-		entries, err := slirpListHostFwd(apiSock)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "seki forward: %v\n", err)
-			os.Exit(1)
-		}
-		if len(entries) == 0 {
-			fmt.Println("no active port forwards")
-			return
-		}
-		for _, e := range entries {
-			fmt.Printf("id=%d  %s  host=%s:%d → guest=%s:%d\n",
-				e.ID, e.Proto, e.HostAddr, e.HostPort, e.GuestAddr, e.GuestPort)
-		}
-	default:
-		port, err := strconv.Atoi(os.Args[2])
-		if err != nil || port < 1 || port > 65535 {
-			fmt.Fprintf(os.Stderr, "seki forward: invalid port: %s\n", os.Args[2])
-			os.Exit(1)
-		}
-
-		// Port forwarding is proxied through the seki parent socket.
-		// The parent calls the slirp4netns API and adds iptables DNAT.
-		sock, err := socket.Connect(false)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "seki forward: %v\n", err)
-			os.Exit(1)
-		}
-		defer sock.Close()
-
-		sock.Emit(socket.Event{Type: "forward", Port: port})
-
-		// Wait for response from parent
-		deadline := time.After(5 * time.Second)
-		for {
-			done := make(chan struct{})
-			var e socket.Event
-			var ok bool
-			go func() {
-				ok = sock.Next()
-				if ok {
-					e, _ = sock.Event()
-				}
-				close(done)
-			}()
-
-			select {
-			case <-done:
-				if !ok {
-					fmt.Fprintln(os.Stderr, "seki forward: connection closed")
-					os.Exit(1)
-				}
-				if e.Type == "forward_done" && e.Port == port {
-					fmt.Printf("forwarding port %d (id=%d) — accessible at localhost:%d\n", port, e.ForwardID, port)
-					return
-				}
-				if e.Type == "forward_error" && e.Port == port {
-					fmt.Fprintf(os.Stderr, "seki forward: %s\n", e.Error)
-					os.Exit(1)
-				}
-				// Ignore other events, keep waiting
-			case <-deadline:
-				fmt.Fprintln(os.Stderr, "seki forward: timeout waiting for response")
+			if e.Type == "forward_done" && e.Port == port {
+				fmt.Printf("forwarding guest:%d → localhost:%d\n", port, e.HostPort)
+				return
+			}
+			if e.Type == "forward_error" && e.Port == port {
+				fmt.Fprintf(os.Stderr, "seki forward: %s\n", e.Error)
 				os.Exit(1)
 			}
+		case <-deadline:
+			fmt.Fprintln(os.Stderr, "seki forward: timeout waiting for response")
+			os.Exit(1)
 		}
 	}
 }
@@ -1362,40 +1288,6 @@ func cmdHostPort() {
 		fmt.Fprintf(os.Stderr, "seki host-port: unknown subcommand %q\n", os.Args[2])
 		os.Exit(1)
 	}
-}
-
-type hostFwdEntry struct {
-	ID        int    `json:"id"`
-	Proto     string `json:"proto"`
-	HostAddr  string `json:"host_addr"`
-	HostPort  int    `json:"host_port"`
-	GuestAddr string `json:"guest_addr"`
-	GuestPort int    `json:"guest_port"`
-}
-
-// slirpListHostFwd lists active host-to-guest port forwards.
-func slirpListHostFwd(apiSock string) ([]hostFwdEntry, error) {
-	req := map[string]interface{}{"execute": "list_hostfwd"}
-	resp, err := slirpAPICall(apiSock, req)
-	if err != nil {
-		return nil, err
-	}
-	ret, ok := resp["return"].(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected response: %v", resp)
-	}
-	entriesRaw, ok := ret["entries"].([]interface{})
-	if !ok {
-		return nil, nil
-	}
-	var entries []hostFwdEntry
-	for _, raw := range entriesRaw {
-		data, _ := json.Marshal(raw)
-		var e hostFwdEntry
-		json.Unmarshal(data, &e)
-		entries = append(entries, e)
-	}
-	return entries, nil
 }
 
 // slirpAPICall sends a JSON request to the slirp4netns API socket and returns the response.
