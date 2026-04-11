@@ -650,17 +650,31 @@ func cmdEmit() {
 		msg = msg[:maxLen] + "…"
 	}
 
+	cwd, _ := os.Getwd()
+	evt := socket.Event{Type: "emit", Message: msg, Cwd: cwd}
+
+	// Inside a sandbox session, send only to our own socket.
+	if os.Getenv("SEKI_SOCK") != "" {
+		c, err := socket.Connect(false)
+		if err != nil {
+			return
+		}
+		c.Emit(evt)
+		c.Close()
+		return
+	}
+
+	// Outside sandbox: broadcast to all sessions (fallback).
 	paths, err := socket.SockGlob()
 	if err != nil || len(paths) == 0 {
-		return // no active sessions, silently exit
+		return
 	}
 	for _, p := range paths {
 		c, err := socket.ConnectPath(p)
 		if err != nil {
 			continue
 		}
-		cwd, _ := os.Getwd()
-		c.Emit(socket.Event{Type: "emit", Message: msg, Cwd: cwd})
+		c.Emit(evt)
 		c.Close()
 	}
 }
