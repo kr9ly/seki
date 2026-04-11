@@ -356,8 +356,15 @@ func cmdWatch() {
 		newTui := buildTUI(tui.rows, tui.cols, len(queue))
 		if newTui.logBottom != tui.logBottom {
 			// Layout changed: update scroll region
+			oldBottom := tui.logBottom
 			tui = newTui
 			applyScrollRegion(tui)
+			if tui.logBottom > oldBottom {
+				// Queue shrank: old separator/items now in log region — erase them
+				for r := oldBottom + 1; r <= tui.logBottom; r++ {
+					fmt.Printf("\033[%d;1H\033[2K", r)
+				}
+			}
 		}
 		clearQueueArea(tui)
 
@@ -426,6 +433,7 @@ func cmdWatch() {
 			queueMu.Lock()
 			r, c := termSize()
 			tui = buildTUI(r, c, len(queue))
+			fmt.Print("\033[2J\033[H") // clear entire screen on resize
 			applyScrollRegion(tui)
 			renderQueueArea()
 			queueMu.Unlock()
