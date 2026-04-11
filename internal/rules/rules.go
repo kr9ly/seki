@@ -195,7 +195,8 @@ func (rs *RuleSet) EvaluateCommand(cmd string) Result {
 	return Result{Action: Allow}
 }
 
-// AddRule appends or updates a rule. Ordering is handled by Save.
+// AddRule appends or updates a rule, then re-sorts by specificity so that
+// new rules take effect immediately (not shadowed by a catch-all).
 func (rs *RuleSet) AddRule(match, action, tag, kind string) {
 	for i, r := range rs.Rules {
 		if r.Match == match && r.Kind == kind {
@@ -205,6 +206,7 @@ func (rs *RuleSet) AddRule(match, action, tag, kind string) {
 		}
 	}
 	rs.Rules = append(rs.Rules, Rule{Match: match, Action: action, Tag: tag, Kind: kind})
+	rs.normalize()
 }
 
 // RemoveRule removes a rule by match pattern.
