@@ -398,7 +398,7 @@ func cmdWatch() {
 					}
 				}
 				if i == 0 {
-					fmt.Printf("\033[%d;1H%s%s — %s[a]%sllow %s[p]%sass %s[d]%seny%s",
+					fmt.Printf("\033[%d;1H%s%s — %s[a]%sllow %s[p]%sass %s[d]%seny (^A/^P/^D)%s",
 						row, prefix, label, bold, reset, bold, reset, bold, reset, reset)
 				} else {
 					fmt.Printf("\033[%d;1H%s%s", row, prefix, label)
@@ -461,7 +461,7 @@ func cmdWatch() {
 				logPrint("%sconnected: %s%s", dim, e.Session, reset)
 
 			case "emit":
-				logPrint("%s» %s%s", dim, e.Message, reset)
+				logPrint("%s%s» %s%s", cwdTag(e.Cwd), dim, e.Message, reset)
 
 			case "session_disconnect":
 				// Remove queue items from this session
@@ -614,20 +614,20 @@ func cmdWatch() {
 			}
 
 			switch key {
-			case 'a', 'A':
+			case 'a', 'A', 0x01: // Ctrl+A: allow (IME-safe)
 				if first.command != "" {
 					first.client.Emit(socket.Event{Type: "cmd_approve", Command: first.command})
 				} else {
 					first.client.Emit(socket.Event{Type: "approve", Domain: first.domain})
 					saveRule(first.domain, rules.Allow)
 				}
-			case 'p', 'P':
+			case 'p', 'P', 0x10: // Ctrl+P: pass (IME-safe)
 				if first.command != "" {
 					first.client.Emit(socket.Event{Type: "cmd_approve", Command: first.command})
 				} else {
 					first.client.Emit(socket.Event{Type: "approve", Domain: first.domain})
 				}
-			case 'd', 'D':
+			case 'd', 'D', 0x04: // Ctrl+D: deny (IME-safe)
 				if first.command != "" {
 					first.client.Emit(socket.Event{Type: "cmd_deny", Command: first.command})
 				} else {
@@ -659,7 +659,8 @@ func cmdEmit() {
 		if err != nil {
 			continue
 		}
-		c.Emit(socket.Event{Type: "emit", Message: msg})
+		cwd, _ := os.Getwd()
+		c.Emit(socket.Event{Type: "emit", Message: msg, Cwd: cwd})
 		c.Close()
 	}
 }
