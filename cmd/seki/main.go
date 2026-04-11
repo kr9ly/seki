@@ -254,6 +254,7 @@ func cmdWatch() {
 		domain  string
 		dest    string
 		command string
+		cwd     string
 		client  *socket.Client // source session for routing approve/deny
 	}
 	type taggedEvent struct {
@@ -524,31 +525,35 @@ func cmdWatch() {
 
 			case "approval":
 				queueMu.Lock()
-				queue = append(queue, queueItem{domain: e.Domain, dest: e.Dest, client: te.client})
+				queue = append(queue, queueItem{domain: e.Domain, dest: e.Dest, cwd: e.Cwd, client: te.client})
 				renderQueueArea()
 				queueMu.Unlock()
 
 			case "approve":
 				queueMu.Lock()
+				cwd := e.Cwd
 				for i, item := range queue {
 					if item.domain == e.Domain && item.command == "" {
+						cwd = item.cwd
 						queue = append(queue[:i], queue[i+1:]...)
 						break
 					}
 				}
-				logPrint("%s%s✓ approved: %s%s", cwdTag(e.Cwd), green, e.Domain, reset)
+				logPrint("%s%s✓ approved: %s%s", cwdTag(cwd), green, e.Domain, reset)
 				renderQueueArea()
 				queueMu.Unlock()
 
 			case "deny":
 				queueMu.Lock()
+				cwd := e.Cwd
 				for i, item := range queue {
 					if item.domain == e.Domain && item.command == "" {
+						cwd = item.cwd
 						queue = append(queue[:i], queue[i+1:]...)
 						break
 					}
 				}
-				logPrint("%s%s✗ denied: %s%s", cwdTag(e.Cwd), red, e.Domain, reset)
+				logPrint("%s%s✗ denied: %s%s", cwdTag(cwd), red, e.Domain, reset)
 				renderQueueArea()
 				queueMu.Unlock()
 
@@ -561,32 +566,36 @@ func cmdWatch() {
 
 			case "cmd_approval":
 				queueMu.Lock()
-				queue = append(queue, queueItem{command: e.Command, client: te.client})
+				queue = append(queue, queueItem{command: e.Command, cwd: e.Cwd, client: te.client})
 				logPrint("%s%scmd%s  %s — %s⏳ pending%s", cwdTag(e.Cwd), cyan, reset, e.Command, cyan, reset)
 				renderQueueArea()
 				queueMu.Unlock()
 
 			case "cmd_approve":
 				queueMu.Lock()
+				cwd := e.Cwd
 				for i, item := range queue {
 					if item.command == e.Command {
+						cwd = item.cwd
 						queue = append(queue[:i], queue[i+1:]...)
 						break
 					}
 				}
-				logPrint("%s%s✓ approved cmd: %s%s", cwdTag(e.Cwd), green, e.Command, reset)
+				logPrint("%s%s✓ approved cmd: %s%s", cwdTag(cwd), green, e.Command, reset)
 				renderQueueArea()
 				queueMu.Unlock()
 
 			case "cmd_deny":
 				queueMu.Lock()
+				cwd := e.Cwd
 				for i, item := range queue {
 					if item.command == e.Command {
+						cwd = item.cwd
 						queue = append(queue[:i], queue[i+1:]...)
 						break
 					}
 				}
-				logPrint("%s%s✗ denied cmd: %s%s", cwdTag(e.Cwd), red, e.Command, reset)
+				logPrint("%s%s✗ denied cmd: %s%s", cwdTag(cwd), red, e.Command, reset)
 				renderQueueArea()
 				queueMu.Unlock()
 			}
@@ -796,6 +805,7 @@ func checkCommand(cmd string) {
 			Type:    "cmd_approval",
 			Command: cmd,
 			Action:  "prompt",
+			Cwd:     os.Getenv("SEKI_CWD"),
 		})
 
 		approvalTimeout := 30 * time.Second
