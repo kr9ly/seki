@@ -8,33 +8,46 @@ import (
 	"github.com/kr9ly/seki/internal/proxy"
 )
 
-// hostForwarder listens on sandbox localhost and forwards to the host
-// via the slirp4netns gateway. This makes host services (e.g. MCP servers)
-// transparently accessible from inside the sandbox.
+// hostForwarder listens on sandbox localhost (IPv4 + IPv6) and forwards
+// to the host via the slirp4netns gateway. This makes host services
+// (e.g. MCP servers) transparently accessible from inside the sandbox.
 type hostForwarder struct {
-	ln net.Listener
+	listeners []net.Listener
 }
 
 func startHostForwarder(port int) (*hostForwarder, error) {
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-
 	target := fmt.Sprintf("%s:%d", SlirpGateway, port)
 
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go forwardConn(conn, target)
-		}
-	}()
+	addrs := []string{
+		fmt.Sprintf("127.0.0.1:%d", port),
+		fmt.Sprintf("[::1]:%d", port),
+	}
 
-	return &hostForwarder{ln: ln}, nil
+	var listeners []net.Listener
+	for _, addr := range addrs {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			// IPv6 may be unavailable; require at least IPv4.
+			if len(listeners) > 0 {
+				break
+			}
+			return nil, err
+		}
+		listeners = append(listeners, ln)
+		go acceptLoop(ln, target)
+	}
+
+	return &hostForwarder{listeners: listeners}, nil
+}
+
+func acceptLoop(ln net.Listener, target string) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go forwardConn(conn, target)
+	}
 }
 
 func forwardConn(client net.Conn, target string) {
@@ -59,5 +72,11 @@ func forwardConn(client net.Conn, target string) {
 }
 
 func (f *hostForwarder) Close() error {
-	return f.ln.Close()
+	var firstErr error
+	for _, ln := range f.listeners {
+		if err := ln.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
