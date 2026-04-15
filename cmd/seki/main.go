@@ -156,10 +156,12 @@ func cmdNsExec() {
 
 	// Mount writable tmpfs on system paths that Podman needs.
 	// We have CAP_SYS_ADMIN via ambient caps.
+	// Preserve existing entries by bind-mounting them back after the tmpfs
+	// overlay. seki's job is network isolation, not filesystem sandboxing,
+	// so we should not destroy unrelated runtime state (e.g. WSL interop
+	// sockets under /run/WSL/).
 	for _, dir := range []string{"/var", "/run"} {
-		if err := syscall.Mount("tmpfs", dir, "tmpfs", 0, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "seki __ns-exec: mount tmpfs %s: %v\n", dir, err)
-		}
+		mountTmpfsPreserving(dir)
 	}
 	os.MkdirAll("/var/tmp", 0777)
 	os.MkdirAll("/run/lock", 0755)
@@ -1585,3 +1587,54 @@ func slirpAPICall(apiSock string, req map[string]interface{}) (map[string]interf
 	return resp, nil
 }
 
+// mountTmpfsPreserving mounts a tmpfs on dir while preserving existing
+// entries. It opens file descriptors to the original children before
+// mounting tmpfs (which shadows them), then bind-mounts each one back
+// via /proc/self/fd/<n>.
+func mountTmpfsPreserving(dir string) {
+	entries, _ := os.ReadDir(dir)
+
+	// Open fds to each top-level entry BEFORE the tmpfs mount shadows them.
+	type preserved struct {
+		name  string
+		fd    int
+		isDir bool
+	}
+	var keep []preserved
+	for _, e := range entries {
+		src := filepath.Join(dir, e.Name())
+		fd, err := syscall.Open(src, unix.O_PATH|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			continue
+		}
+		keep = append(keep, preserved{name: e.Name(), fd: fd, isDir: e.IsDir()})
+	}
+
+	if err := syscall.Mount("tmpfs", dir, "tmpfs", 0, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "seki __ns-exec: mount tmpfs %s: %v\n", dir, err)
+		for _, k := range keep {
+			syscall.Close(k.fd)
+		}
+		return
+	}
+
+	// Bind-mount each preserved entry back into the fresh tmpfs.
+	for _, k := range keep {
+		dst := filepath.Join(dir, k.name)
+		if k.isDir {
+			os.MkdirAll(dst, 0755)
+		} else {
+			f, err := os.Create(dst)
+			if err != nil {
+				syscall.Close(k.fd)
+				continue
+			}
+			f.Close()
+		}
+		src := fmt.Sprintf("/proc/self/fd/%d", k.fd)
+		if err := syscall.Mount(src, dst, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "seki __ns-exec: bind-mount %s -> %s: %v\n", src, dst, err)
+		}
+		syscall.Close(k.fd)
+	}
+}
