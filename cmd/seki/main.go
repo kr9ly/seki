@@ -24,6 +24,19 @@ import (
 )
 
 func main() {
+	// When bind-mounted over /usr/bin/newuidmap or /usr/bin/newgidmap,
+	// argv[0] identifies which helper to run. This replaces the setuid
+	// helpers (whose setuid bit is ignored inside user namespaces) with
+	// direct writes using ambient CAP_SETUID/CAP_SETGID.
+	switch filepath.Base(os.Args[0]) {
+	case "newuidmap":
+		cmdNewUIDMap()
+		return
+	case "newgidmap":
+		cmdNewGIDMap()
+		return
+	}
+
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: seki <command> [args...]")
 		fmt.Fprintln(os.Stderr, "commands: exec, log, rules, check, query, watch, mode, credential, forward, host-port")
@@ -125,10 +138,10 @@ func cmdNsSetup() {
 	}
 }
 
-// cmdNsExec runs in the inner user namespace (for Podman support).
-// Two-phase design: first invocation waits for uid_map, then re-execs itself
-// to trigger capability recalculation. Second invocation has full capabilities
-// and sets up writable tmpfs mounts before execing the user command.
+// cmdNsExec runs in the inner user namespace with ambient capabilities
+// (CAP_SETUID, CAP_SETGID, CAP_SYS_ADMIN). It waits for uid_map to be set,
+// then sets up the namespace (tmpfs mounts, newuidmap wrapper, Podman config)
+// and execs the user command. Ambient caps survive all execs in the chain.
 func cmdNsExec() {
 	args := argsAfterSep(os.Args[2:])
 	if len(args) == 0 {
@@ -136,28 +149,40 @@ func cmdNsExec() {
 		os.Exit(1)
 	}
 
-	if os.Getenv("SEKI_NS_MAPPED") != "1" {
-		// Phase 1: wait for parent to write uid/gid maps, then re-exec.
-		buf := make([]byte, 1)
-		syscall.Read(3, buf)
-		syscall.Close(3)
+	// Wait for parent to write uid/gid maps.
+	buf := make([]byte, 1)
+	syscall.Read(3, buf)
+	syscall.Close(3)
 
-		self, err := os.Executable()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "seki __ns-exec: executable path: %v\n", err)
-			os.Exit(1)
+	// Mount writable tmpfs on system paths that Podman needs.
+	// We have CAP_SYS_ADMIN via ambient caps.
+	for _, dir := range []string{"/var", "/run"} {
+		if err := syscall.Mount("tmpfs", dir, "tmpfs", 0, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "seki __ns-exec: mount tmpfs %s: %v\n", dir, err)
 		}
-		env := append(os.Environ(), "SEKI_NS_MAPPED=1")
-		argv := append([]string{self, "__ns-exec", "--"}, args...)
-		if err := syscall.Exec(self, argv, env); err != nil {
-			fmt.Fprintf(os.Stderr, "seki __ns-exec: re-exec: %v\n", err)
-			os.Exit(1)
-		}
-		return
+	}
+	os.MkdirAll("/var/tmp", 0777)
+	os.MkdirAll("/run/lock", 0755)
+	// Recreate XDG_RUNTIME_DIR on the fresh tmpfs
+	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+		os.MkdirAll(xdg, 0700)
 	}
 
-	// Phase 2: uid_map is set, capabilities recalculated via exec.
-	// Exec user command.
+	// Bind-mount seki over /usr/bin/newuidmap and /usr/bin/newgidmap.
+	// The real setuid helpers don't work inside user namespaces (setuid
+	// bit is ignored). Our wrapper uses ambient CAP_SETUID/CAP_SETGID
+	// to write uid_map/gid_map directly.
+	self, _ := os.Executable()
+	for _, target := range []string{"/usr/bin/newuidmap", "/usr/bin/newgidmap"} {
+		if err := syscall.Mount(self, target, "", syscall.MS_BIND, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "seki __ns-exec: bind-mount %s: %v\n", target, err)
+		}
+	}
+
+	// Ensure Podman config files exist
+	setupPodmanConfig()
+
+	// Exec user command (ambient caps survive this exec)
 	path, err := exec.LookPath(args[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "seki __ns-exec: %v\n", err)
@@ -215,7 +240,15 @@ func cmdChild() {
 		cmd.Env = append(os.Environ(), "SEKI_ACTIVE=1")
 		cmd.ExtraFiles = []*os.File{mapReadyPr} // fd 3 = mapReady
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Cloneflags: syscall.CLONE_NEWUSER,
+			// CLONE_NEWNS: needed for tmpfs mounts and bind-mounting newuidmap wrapper
+			Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+			// Ambient caps survive exec: the user command (and Podman, and our
+			// newuidmap wrapper) all inherit these capabilities.
+			AmbientCaps: []uintptr{
+				uintptr(unix.CAP_SETUID),
+				uintptr(unix.CAP_SETGID),
+				uintptr(unix.CAP_SYS_ADMIN),
+			},
 		}
 
 		if err := cmd.Start(); err != nil {
@@ -1243,6 +1276,46 @@ func cmdCredential() {
 
 // argsAfterSep returns the arguments after "--".
 // If no "--" is found, returns all arguments.
+// cmdNewUIDMap is a drop-in replacement for /usr/bin/newuidmap.
+// It writes to /proc/PID/uid_map directly using ambient CAP_SETUID.
+func cmdNewUIDMap() {
+	if len(os.Args) < 5 || (len(os.Args)-2)%3 != 0 {
+		fmt.Fprintf(os.Stderr, "usage: newuidmap <pid> <inner> <outer> <count> [...]\n")
+		os.Exit(1)
+	}
+	pid := os.Args[1]
+
+	var mapping strings.Builder
+	for i := 2; i < len(os.Args); i += 3 {
+		fmt.Fprintf(&mapping, "%s %s %s\n", os.Args[i], os.Args[i+1], os.Args[i+2])
+	}
+
+	if err := os.WriteFile(fmt.Sprintf("/proc/%s/uid_map", pid), []byte(mapping.String()), 0); err != nil {
+		fmt.Fprintf(os.Stderr, "newuidmap: write to uid_map failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// cmdNewGIDMap is a drop-in replacement for /usr/bin/newgidmap.
+// It writes to /proc/PID/gid_map directly using ambient CAP_SETGID.
+func cmdNewGIDMap() {
+	if len(os.Args) < 5 || (len(os.Args)-2)%3 != 0 {
+		fmt.Fprintf(os.Stderr, "usage: newgidmap <pid> <inner> <outer> <count> [...]\n")
+		os.Exit(1)
+	}
+	pid := os.Args[1]
+
+	var mapping strings.Builder
+	for i := 2; i < len(os.Args); i += 3 {
+		fmt.Fprintf(&mapping, "%s %s %s\n", os.Args[i], os.Args[i+1], os.Args[i+2])
+	}
+
+	if err := os.WriteFile(fmt.Sprintf("/proc/%s/gid_map", pid), []byte(mapping.String()), 0); err != nil {
+		fmt.Fprintf(os.Stderr, "newgidmap: write to gid_map failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 // setupPodmanConfig creates default Podman config files if they don't exist.
 func setupPodmanConfig() {
 	home := os.Getenv("HOME")
