@@ -130,22 +130,58 @@ func Exec(args []string) (*Sandbox, error) {
 		}
 	}
 
-	// Re-exec as __child in new user+network+mount namespaces
-	childArgs := append([]string{"__child", "--"}, args...)
+	// Re-exec in new user+network+mount namespaces.
+	// When subuid/subgid are available, we use a two-phase exec:
+	//   1. clone+exec __ns-setup (uid 65534, no capabilities needed)
+	//   2. parent calls newuidmap/newgidmap
+	//   3. __ns-setup re-execs as __child (uid 0, full capabilities)
+	// This is necessary because:
+	//   - Multi-entry uid_map requires newuidmap (setuid root helper)
+	//   - uid_map must be set BEFORE exec for capabilities to be granted
+	//   - Go's exec.Command combines clone+exec atomically
+	subUID, subGID := ParseSubIDs()
+	useSubIDs := subUID != nil && subGID != nil
+
+	var childArgs []string
+	if useSubIDs {
+		childArgs = append([]string{"__ns-setup", "--"}, args...)
+	} else {
+		childArgs = append([]string{"__child", "--"}, args...)
+	}
 	cmd := exec.Command(self, childArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = buildChildEnv(self, sshProxyPath, credCfg.SecretKeys())
-	cmd.ExtraFiles = []*os.File{syncPr} // fd 3
+	cmd.Env = buildChildEnv(self, sshProxyPath, credCfg.SecretKeys(), subUID, subGID)
+
+	var mapReadyPr, mapReadyPw *os.File
+	if useSubIDs {
+		// mapReady pipe: parent writes after newuidmap/newgidmap complete.
+		// fd 3 = sync pipe (for __child), fd 4 = mapReady pipe (for __ns-setup)
+		var err error
+		mapReadyPr, mapReadyPw, err = os.Pipe()
+		if err != nil {
+			syncPr.Close()
+			syncPw.Close()
+			exitPr.Close()
+			exitPw.Close()
+			return nil, fmt.Errorf("create map-ready pipe: %w", err)
+		}
+		cmd.ExtraFiles = []*os.File{syncPr, mapReadyPr} // fd 3, fd 4
+	} else {
+		cmd.ExtraFiles = []*os.File{syncPr} // fd 3
+	}
+
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET | syscall.CLONE_NEWNS,
-		UidMappings: []syscall.SysProcIDMap{
+	}
+	if !useSubIDs {
+		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
 			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
-		},
-		GidMappings: []syscall.SysProcIDMap{
+		}
+		cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
 			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
-		},
+		}
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -153,10 +189,31 @@ func Exec(args []string) (*Sandbox, error) {
 		syncPw.Close()
 		exitPr.Close()
 		exitPw.Close()
+		if mapReadyPr != nil {
+			mapReadyPr.Close()
+			mapReadyPw.Close()
+		}
 		return nil, fmt.Errorf("start child: %w", err)
 	}
 	syncPr.Close()
+	if mapReadyPr != nil {
+		mapReadyPr.Close()
+	}
 	sb.cmd = cmd
+
+	// Set uid/gid mappings and signal __ns-setup to re-exec as __child.
+	if useSubIDs {
+		if err := applySubIDMappings(cmd.Process.Pid, subUID, subGID); err != nil {
+			cmd.Process.Kill()
+			syncPw.Close()
+			exitPr.Close()
+			exitPw.Close()
+			mapReadyPw.Close()
+			return nil, fmt.Errorf("subid mapping: %w", err)
+		}
+		mapReadyPw.Write([]byte{1})
+		mapReadyPw.Close()
+	}
 
 	// Ready pipe: slirp4netns writes a byte when tap0 is configured
 	readyPr, readyPw, err := os.Pipe()
@@ -862,7 +919,7 @@ func addPreroutingDNAT(port int) error {
 // It injects git credential helper config, filters conflicting GIT_CONFIG_* vars,
 // and strips secret environment variables referenced by credential config.
 // If sshProxyPath is non-empty, SSH_AUTH_SOCK is replaced with the proxy socket path.
-func buildChildEnv(sekiBin string, sshProxyPath string, secretKeys []string) []string {
+func buildChildEnv(sekiBin string, sshProxyPath string, secretKeys []string, subUID, subGID *SubIDRange) []string {
 	env := os.Environ()
 
 	// Build set of secret key prefixes for O(1) lookup.
@@ -907,6 +964,9 @@ func buildChildEnv(sekiBin string, sshProxyPath string, secretKeys []string) []s
 	)
 	if sshProxyPath != "" {
 		filtered = append(filtered, "SSH_AUTH_SOCK="+sshProxyPath)
+	}
+	if v := subIDEnvValue(subUID, subGID); v != "" {
+		filtered = append(filtered, subIDEnvKey+"="+v)
 	}
 	return filtered
 }

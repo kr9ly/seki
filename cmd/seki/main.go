@@ -33,6 +33,10 @@ func main() {
 	switch os.Args[1] {
 	case "exec":
 		cmdExec()
+	case "__ns-setup":
+		cmdNsSetup()
+	case "__ns-exec":
+		cmdNsExec()
 	case "__child":
 		cmdChild()
 	case "log":
@@ -86,6 +90,85 @@ func cmdExec() {
 	}
 }
 
+// cmdNsSetup is an intermediate process for setting up multi-entry uid/gid maps.
+// It runs in the new user namespace with uid 65534 (no capabilities needed).
+// It waits for the parent to call newuidmap/newgidmap, then re-execs as __child.
+// The re-exec triggers capability recalculation with uid_map set, giving __child
+// full capabilities as uid 0.
+//
+// fd layout:
+//   fd 3 = sync pipe (passed through to __child for slirp4netns readiness)
+//   fd 4 = mapReady pipe (read by this process; closed before re-exec)
+func cmdNsSetup() {
+	args := argsAfterSep(os.Args[2:])
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "seki __ns-setup: no command specified")
+		os.Exit(1)
+	}
+
+	// Wait for parent to set uid/gid maps via newuidmap/newgidmap.
+	// Use raw syscall to avoid Go setting close-on-exec on the fd.
+	buf := make([]byte, 1)
+	syscall.Read(4, buf)
+	syscall.Close(4)
+
+	// Re-exec as __child. fd 3 (sync pipe) stays open across exec.
+	self, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki __ns-setup: executable path: %v\n", err)
+		os.Exit(1)
+	}
+	argv := append([]string{self, "__child", "--"}, args...)
+	if err := syscall.Exec(self, argv, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "seki __ns-setup: exec __child: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// cmdNsExec runs in the inner user namespace (for Podman support).
+// Two-phase design: first invocation waits for uid_map, then re-execs itself
+// to trigger capability recalculation. Second invocation has full capabilities
+// and sets up writable tmpfs mounts before execing the user command.
+func cmdNsExec() {
+	args := argsAfterSep(os.Args[2:])
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "seki __ns-exec: no command specified")
+		os.Exit(1)
+	}
+
+	if os.Getenv("SEKI_NS_MAPPED") != "1" {
+		// Phase 1: wait for parent to write uid/gid maps, then re-exec.
+		buf := make([]byte, 1)
+		syscall.Read(3, buf)
+		syscall.Close(3)
+
+		self, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki __ns-exec: executable path: %v\n", err)
+			os.Exit(1)
+		}
+		env := append(os.Environ(), "SEKI_NS_MAPPED=1")
+		argv := append([]string{self, "__ns-exec", "--"}, args...)
+		if err := syscall.Exec(self, argv, env); err != nil {
+			fmt.Fprintf(os.Stderr, "seki __ns-exec: re-exec: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Phase 2: uid_map is set, capabilities recalculated via exec.
+	// Exec user command.
+	path, err := exec.LookPath(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki __ns-exec: %v\n", err)
+		os.Exit(127)
+	}
+	if err := syscall.Exec(path, args, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "seki __ns-exec: exec %v: %v\n", args[0], err)
+		os.Exit(1)
+	}
+}
+
 func cmdChild() {
 	args := argsAfterSep(os.Args[2:])
 	if len(args) == 0 {
@@ -102,30 +185,102 @@ func cmdChild() {
 	}
 	defer state.Close()
 
-	// Run user command as subprocess in a nested user namespace so it
-	// appears as non-root (uid SandboxUID). The outer namespace keeps uid 0
-	// for ChildSetup's mount/iptables operations.
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "SEKI_ACTIVE=1")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUSER,
-		UidMappings: []syscall.SysProcIDMap{
-			{ContainerID: netns.SandboxUID, HostID: 0, Size: 1},
-		},
-		GidMappings: []syscall.SysProcIDMap{
-			{ContainerID: netns.SandboxGID, HostID: 0, Size: 1},
-		},
-	}
+	// Run user command in a nested user namespace as uid SandboxUID (1000).
+	// The outer namespace keeps uid 0 for ChildSetup's mount/iptables.
+	// When subuid is available, the range is also mapped into the inner
+	// namespace. cmdChild (uid 0 in outer ns) has CAP_SETUID so it can
+	// write multi-entry uid_map directly.
+	subUID, subGID := netns.ParseSubIDEnv()
+	useSubIDs := subUID != nil && subGID != nil
 
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
+	if useSubIDs {
+		// Multi-entry uid_map: use __ns-exec to wait for parent's direct
+		// write, then re-exec to gain capabilities for the user command.
+		mapReadyPr, mapReadyPw, err := os.Pipe()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki: create map-ready pipe: %v\n", err)
+			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "seki: exec %v: %v\n", args[0], err)
-		os.Exit(1)
+
+		self, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki: executable path: %v\n", err)
+			os.Exit(1)
+		}
+		nsExecArgs := append([]string{self, "__ns-exec", "--"}, args...)
+		cmd := exec.Command(nsExecArgs[0], nsExecArgs[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Env = append(os.Environ(), "SEKI_ACTIVE=1")
+		cmd.ExtraFiles = []*os.File{mapReadyPr} // fd 3 = mapReady
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Cloneflags: syscall.CLONE_NEWUSER,
+		}
+
+		if err := cmd.Start(); err != nil {
+			mapReadyPr.Close()
+			mapReadyPw.Close()
+			fmt.Fprintf(os.Stderr, "seki: start user command: %v\n", err)
+			os.Exit(1)
+		}
+		mapReadyPr.Close()
+
+		// Write uid/gid maps directly. cmdChild runs as uid 0 in the outer
+		// namespace with CAP_SETUID/CAP_SETGID — multi-entry writes succeed.
+		pid := cmd.Process.Pid
+		uidMap := fmt.Sprintf("%d 0 1\n%d %d %d\n",
+			netns.SandboxUID, subUID.Start, subUID.Start, subUID.Count)
+		gidMap := fmt.Sprintf("%d 0 1\n%d %d %d\n",
+			netns.SandboxGID, subGID.Start, subGID.Start, subGID.Count)
+
+		if err := os.WriteFile(fmt.Sprintf("/proc/%d/uid_map", pid), []byte(uidMap), 0); err != nil {
+			cmd.Process.Kill()
+			mapReadyPw.Close()
+			fmt.Fprintf(os.Stderr, "seki: write uid_map: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(fmt.Sprintf("/proc/%d/gid_map", pid), []byte(gidMap), 0); err != nil {
+			cmd.Process.Kill()
+			mapReadyPw.Close()
+			fmt.Fprintf(os.Stderr, "seki: write gid_map: %v\n", err)
+			os.Exit(1)
+		}
+
+		mapReadyPw.Write([]byte{1})
+		mapReadyPw.Close()
+
+		if err := cmd.Wait(); err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				os.Exit(exitErr.ExitCode())
+			}
+			fmt.Fprintf(os.Stderr, "seki: exec %v: %v\n", args[0], err)
+			os.Exit(1)
+		}
+	} else {
+		// No subuid: single-entry mapping via Go's built-in write.
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Env = append(os.Environ(), "SEKI_ACTIVE=1")
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Cloneflags: syscall.CLONE_NEWUSER,
+			UidMappings: []syscall.SysProcIDMap{
+				{ContainerID: netns.SandboxUID, HostID: 0, Size: 1},
+			},
+			GidMappings: []syscall.SysProcIDMap{
+				{ContainerID: netns.SandboxGID, HostID: 0, Size: 1},
+			},
+		}
+
+		if err := cmd.Run(); err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				os.Exit(exitErr.ExitCode())
+			}
+			fmt.Fprintf(os.Stderr, "seki: exec %v: %v\n", args[0], err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -1088,6 +1243,28 @@ func cmdCredential() {
 
 // argsAfterSep returns the arguments after "--".
 // If no "--" is found, returns all arguments.
+// setupPodmanConfig creates default Podman config files if they don't exist.
+func setupPodmanConfig() {
+	home := os.Getenv("HOME")
+	if home == "" {
+		return
+	}
+	dir := filepath.Join(home, ".config", "containers")
+	os.MkdirAll(dir, 0755)
+
+	// policy.json: allow all images (default permissive policy)
+	policyPath := filepath.Join(dir, "policy.json")
+	if _, err := os.Stat(policyPath); err != nil {
+		os.WriteFile(policyPath, []byte(`{"default":[{"type":"insecureAcceptAnything"}]}`+"\n"), 0644)
+	}
+
+	// registries.conf: enable short-name resolution via docker.io
+	registriesPath := filepath.Join(dir, "registries.conf")
+	if _, err := os.Stat(registriesPath); err != nil {
+		os.WriteFile(registriesPath, []byte("unqualified-search-registries = [\"docker.io\"]\n"), 0644)
+	}
+}
+
 func argsAfterSep(args []string) []string {
 	for i, a := range args {
 		if a == "--" {
