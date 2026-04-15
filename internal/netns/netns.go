@@ -737,7 +737,12 @@ func overrideResolvConf() error {
 	if err := os.WriteFile(tmpPath, content, 0644); err != nil {
 		return fmt.Errorf("write temp resolv.conf: %w", err)
 	}
-	defer os.Remove(tmpPath)
+	// Do NOT remove tmpPath. The bind mount keeps the inode alive, but
+	// if the source path is unlinked, it shows as "//deleted" in
+	// mountinfo and subsequent mount(2) calls targeting /etc/resolv.conf
+	// in child mount namespaces fail with ENOENT (path resolution hits
+	// the deleted dentry). The temp file lives in the mount namespace
+	// and is cleaned up when the namespace exits.
 
 	// Bind mount over /etc/resolv.conf
 	if err := syscall.Mount(tmpPath, "/etc/resolv.conf", "", syscall.MS_BIND, ""); err != nil {
