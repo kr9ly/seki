@@ -30,6 +30,7 @@ type Event struct {
 	Session      string `json:"session,omitempty"`
 	Cwd          string `json:"cwd,omitempty"`
 	LearningMode bool   `json:"learning_mode,omitempty"`
+	Profile      string `json:"profile,omitempty"`
 	// Approval queue fields
 	QueueSize int `json:"queue_size,omitempty"`
 	// Port forwarding

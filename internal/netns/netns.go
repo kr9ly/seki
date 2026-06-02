@@ -749,6 +749,10 @@ func overrideResolvConf() error {
 	// Make /etc private so our bind mount on resolv.conf doesn't propagate.
 	// Only /etc — not / — to preserve MS_SHARED on /tmp etc. that Podman
 	// rootless port forwarding relies on.
+	// /etc is not a mount point by default, so bind-mount it onto itself first.
+	if err := syscall.Mount("/etc", "/etc", "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+		return fmt.Errorf("bind /etc: %w", err)
+	}
 	if err := syscall.Mount("", "/etc", "", syscall.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make /etc private: %w", err)
 	}

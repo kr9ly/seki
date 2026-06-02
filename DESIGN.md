@@ -644,6 +644,93 @@ credential helper proxy が未実装の間は、~/.ssh を /root/.ssh に
 bind-mount して SSH を直接使えるようにしている。
 credential helper proxy 完成後にこの bind-mount は削除する。
 
+## Claude Code プロファイル切り替え
+
+プロジェクトごとに異なる Claude Code の OAuth アカウント（サブスクリプション）を使い分ける仕組み。
+seki の mount namespace を利用して、credentials ファイルだけをプロジェクトに応じて差し替える。
+
+### 解く問題
+
+複数の Anthropic アカウント（個人用・業務用など）を持っている場合、
+プロジェクトによって使うアカウントを切り替えたい。
+Claude Code の OAuth credentials は `~/.claude/` に保存されるが、
+同ディレクトリには `CLAUDE.md`、`settings.json` 等の共有設定も含まれており、
+ディレクトリごと差し替えると設定が分断される。
+
+### 方式: credentials ファイルの bind-mount
+
+ディレクトリ全体ではなく、**credentials ファイルだけ** を bind-mount で差し替える。
+
+```
+~/.claude-profiles/
+  personal/
+    .credentials.json      ← OAuth credentials (個人アカウント)
+  work/
+    .credentials.json      ← OAuth credentials (業務アカウント)
+
+~/.claude/
+  CLAUDE.md                ← 共有 (差し替えない)
+  settings.json            ← 共有 (差し替えない)
+  .credentials.json        ← bind-mount でプロファイルのものに差し替え
+```
+
+sandbox 起動時に、mount namespace 内で credentials ファイルを bind-mount する:
+
+```
+host 側 (実体)                                 sandbox 内 (bind-mount)
+────────────────                               ──────────────────────
+~/.claude-profiles/work/.credentials.json  →   ~/.claude/.credentials.json
+```
+
+`~/.claude/` 配下の他のファイル（設定・ドキュメント）はそのまま見える。
+
+### プロファイルマッピング
+
+seki のグローバル設定でプロジェクトパス → プロファイルの対応を定義する。
+glob パターンと default フォールバックで、新規プロジェクト追加時の手間を最小化する。
+
+```yaml
+# ~/.config/seki/config.yaml (または既存の設定ファイルに統合)
+claude_profiles:
+  default: personal
+  projects:
+    /home/kr9ly/projects/kurashiru-*: work
+    /home/kr9ly/projects/nell-*: work
+```
+
+**マッチングルール:**
+1. sandbox 起動時のカレントディレクトリをキーにする
+2. `projects` の glob パターンを上から順にマッチ
+3. マッチしなければ `default` にフォールバック
+4. `default` も未設定ならプロファイル切り替えなし（通常の `~/.claude/.credentials.json` をそのまま使用）
+
+### 初回ログイン
+
+プロファイルの初回セットアップは、sandbox 内で通常通り `claude login` するだけ。
+bind-mount 先のプロファイルディレクトリに credentials が書き込まれる。
+
+```bash
+# 1. プロファイルディレクトリを作成
+mkdir -p ~/.claude-profiles/work
+
+# 2. work プロファイルが適用されるプロジェクトで seki sandbox に入る
+cd /home/kr9ly/projects/kurashiru-android
+seki shell  # (または通常の alias 経由)
+
+# 3. sandbox 内で普通にログイン
+claude login
+# → ~/.claude-profiles/work/.credentials.json に保存される
+```
+
+### クレデンシャル隔離との関係
+
+既存のクレデンシャル隔離（環境変数フィルタ + credential helper proxy）とは独立した仕組み。
+
+- **クレデンシャル隔離**: sandbox 内から API キー等の秘密を不可視にする（防御）
+- **プロファイル切り替え**: Claude Code 自体の認証アカウントを選択する（利便性）
+
+両者は同じ mount namespace 内で共存する。
+
 ## 実装状況
 
 言語: **Go** (ネットワーク操作、バイナリ配布、既存ツールとの一貫性)

@@ -154,6 +154,13 @@ func cmdNsExec() {
 	syscall.Read(3, buf)
 	syscall.Close(3)
 
+	// Make the mount tree shared so Podman rootless (which creates nested
+	// mount namespaces) can see mounts from this namespace. CLONE_NEWNS
+	// copies the parent's tree as slave; we promote back to shared here.
+	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_SHARED, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "seki __ns-exec: make-rshared /: %v\n", err)
+	}
+
 	// Mount writable tmpfs on system paths that Podman needs.
 	// We have CAP_SYS_ADMIN via ambient caps.
 	// Preserve existing entries by bind-mounting them back after the tmpfs
@@ -285,11 +292,13 @@ func cmdChild() {
 		mapReadyPw.Write([]byte{1})
 		mapReadyPw.Close()
 
-		if err := cmd.Wait(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
+		cmdErr := cmd.Wait()
+		netns.SyncBackCredentials()
+		if cmdErr != nil {
+			if exitErr, ok := cmdErr.(*exec.ExitError); ok {
 				os.Exit(exitErr.ExitCode())
 			}
-			fmt.Fprintf(os.Stderr, "seki: exec %v: %v\n", args[0], err)
+			fmt.Fprintf(os.Stderr, "seki: exec %v: %v\n", args[0], cmdErr)
 			os.Exit(1)
 		}
 	} else {
@@ -309,11 +318,13 @@ func cmdChild() {
 			},
 		}
 
-		if err := cmd.Run(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
+		cmdErr := cmd.Run()
+		netns.SyncBackCredentials()
+		if cmdErr != nil {
+			if exitErr, ok := cmdErr.(*exec.ExitError); ok {
 				os.Exit(exitErr.ExitCode())
 			}
-			fmt.Fprintf(os.Stderr, "seki: exec %v: %v\n", args[0], err)
+			fmt.Fprintf(os.Stderr, "seki: exec %v: %v\n", args[0], cmdErr)
 			os.Exit(1)
 		}
 	}
@@ -672,7 +683,11 @@ func cmdWatch() {
 				if e.LearningMode {
 					mode = "learning"
 				}
-				logPrint("%s%ssession: %s  mode: %s%s", cwdTag(e.Cwd), dim, e.Session, mode, reset)
+				profileStr := ""
+				if e.Profile != "" {
+					profileStr = "  profile: " + e.Profile
+				}
+				logPrint("%s%ssession: %s  mode: %s%s%s", cwdTag(e.Cwd), dim, e.Session, mode, profileStr, reset)
 
 			case "dns":
 				color := green
@@ -875,7 +890,7 @@ func saveRule(domain, action string) {
 	if err != nil {
 		return
 	}
-	rs.AddRule(domain, action, "", rules.KindNetwork)
+	_ = rs.AddRule(domain, action, "", rules.KindNetwork)
 	rs.Save()
 }
 
@@ -937,7 +952,10 @@ func cmdRules() {
 				}
 			}
 		}
-		rs.AddRule(match, action, tag, kind)
+		if err := rs.AddRule(match, action, tag, kind); err != nil {
+			fmt.Fprintf(os.Stderr, "seki rules: %v\n", err)
+			os.Exit(1)
+		}
 		if err := rs.Save(); err != nil {
 			fmt.Fprintf(os.Stderr, "seki rules: %v\n", err)
 			os.Exit(1)
@@ -947,6 +965,41 @@ func cmdRules() {
 			prefix = "[command] "
 		}
 		fmt.Printf("added: %s%s %s\n", prefix, action, match)
+
+	case "policy":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "usage: seki rules policy <name>")
+			fmt.Fprintln(os.Stderr, "\navailable policies:")
+			for name, p := range rules.Policies() {
+				fmt.Fprintf(os.Stderr, "  %-12s %s\n", name, p.Description)
+			}
+			os.Exit(1)
+		}
+		name := os.Args[3]
+		policies := rules.Policies()
+		p, ok := policies[name]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "unknown policy: %s\n", name)
+			fmt.Fprintln(os.Stderr, "\navailable policies:")
+			for name, p := range policies {
+				fmt.Fprintf(os.Stderr, "  %-12s %s\n", name, p.Description)
+			}
+			os.Exit(1)
+		}
+		for _, r := range p.Rules {
+			if err := rs.AddRule(r.Match, r.Action, r.Tag, r.Kind); err != nil {
+				fmt.Fprintf(os.Stderr, "seki rules: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		if err := rs.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "seki rules: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("applied policy %q (%d rules)\n", name, len(p.Rules))
+		for _, r := range p.Rules {
+			fmt.Printf("  %-6s %s\n", r.Action, r.Match)
+		}
 
 	case "remove":
 		if len(os.Args) < 4 {

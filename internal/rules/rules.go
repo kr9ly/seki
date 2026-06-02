@@ -111,6 +111,9 @@ func ruleSpecificity(r Rule) int {
 	if r.Match == "*" {
 		return 0
 	}
+	if net.ParseIP(r.Match) != nil {
+		return 310 // bare IP: most specific
+	}
 	if isCIDR(r.Match) {
 		_, cidr, _ := net.ParseCIDR(r.Match)
 		ones, _ := cidr.Mask.Size()
@@ -197,16 +200,23 @@ func (rs *RuleSet) EvaluateCommand(cmd string) Result {
 
 // AddRule appends or updates a rule, then re-sorts by specificity so that
 // new rules take effect immediately (not shadowed by a catch-all).
-func (rs *RuleSet) AddRule(match, action, tag, kind string) {
+// Returns an error if a command rule has an invalid regex pattern.
+func (rs *RuleSet) AddRule(match, action, tag, kind string) error {
+	if kind == KindCommand {
+		if _, err := regexp.Compile(match); err != nil {
+			return fmt.Errorf("invalid regex %q: %w", match, err)
+		}
+	}
 	for i, r := range rs.Rules {
 		if r.Match == match && r.Kind == kind {
 			rs.Rules[i].Action = action
 			rs.Rules[i].Tag = tag
-			return
+			return nil
 		}
 	}
 	rs.Rules = append(rs.Rules, Rule{Match: match, Action: action, Tag: tag, Kind: kind})
 	rs.normalize()
+	return nil
 }
 
 // RemoveRule removes a rule by match pattern.
@@ -224,9 +234,30 @@ func (rs *RuleSet) RemoveRule(match string) bool {
 func matchCommand(pattern, cmd string) bool {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki: invalid command regex %q: %v\n", pattern, err)
 		return false
 	}
 	return re.MatchString(cmd)
+}
+
+// Policy is a named set of predefined rules.
+type Policy struct {
+	Description string
+	Rules       []Rule
+}
+
+// Policies returns built-in policy presets.
+func Policies() map[string]Policy {
+	return map[string]Policy{
+		"gh-write": {
+			Description: "Prompt for GitHub CLI write operations",
+			Rules: []Rule{
+				{Match: `\bgh\s+(pr|issue)\s+(create|merge|close|comment|edit|review|reopen|delete|ready)\b`, Action: Prompt, Tag: "gh-write", Kind: KindCommand},
+				{Match: `\bgh\s+(release|repo|gist|label)\s+(create|delete|edit|rename|fork|archive)\b`, Action: Prompt, Tag: "gh-write", Kind: KindCommand},
+				{Match: `\bgh\s+api\b.*(-X|--method)\s+(POST|PUT|PATCH|DELETE)\b`, Action: Prompt, Tag: "gh-write", Kind: KindCommand},
+			},
+		},
+	}
 }
 
 // DefaultRuleSet returns a minimal starting ruleset in learning mode.
@@ -256,6 +287,11 @@ func matchRule(pattern, domain, ip string) bool {
 		if err == nil && cidr.Contains(net.ParseIP(ip)) {
 			return true
 		}
+	}
+
+	// Try exact IP match (bare IP without CIDR notation)
+	if ip != "" && net.ParseIP(pattern) != nil {
+		return net.ParseIP(pattern).Equal(net.ParseIP(ip))
 	}
 
 	// Try domain glob match
