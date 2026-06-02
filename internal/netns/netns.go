@@ -17,6 +17,7 @@ import (
 	"github.com/kr9ly/seki/internal/credential"
 	sekidns "github.com/kr9ly/seki/internal/dns"
 	"github.com/kr9ly/seki/internal/logger"
+	"github.com/kr9ly/seki/internal/profile"
 	"github.com/kr9ly/seki/internal/proxy"
 	"github.com/kr9ly/seki/internal/rules"
 	"github.com/kr9ly/seki/internal/socket"
@@ -96,6 +97,12 @@ func Exec(args []string) (*Sandbox, error) {
 	}
 	sb.exitPw = exitPw
 
+	globalCfg, err := profile.LoadGlobalConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki: global config: %v\n", err)
+		globalCfg = &profile.GlobalConfig{}
+	}
+
 	// Start credential socket server before cmd.Start() so the path is
 	// known when we build cmd.Env below.
 	credCfg, err := credential.LoadConfig()
@@ -152,7 +159,7 @@ func Exec(args []string) (*Sandbox, error) {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = buildChildEnv(self, sshProxyPath, credCfg.SecretKeys(), subUID, subGID)
+	cmd.Env = buildChildEnv(self, sshProxyPath, credCfg.SecretKeys(), subUID, subGID, globalCfg.SandboxEnv)
 
 	var mapReadyPr, mapReadyPw *os.File
 	if useSubIDs {
@@ -463,6 +470,14 @@ func ChildSetup() (*ChildState, error) {
 		fmt.Fprintf(os.Stderr, "seki: ssh bind-mount: %v\n", err)
 	}
 
+	// Bind-mount Claude Code credentials for profile switching
+	var claudeProfile string
+	if name, err := bindClaudeProfile(); err != nil {
+		fmt.Fprintf(os.Stderr, "seki: claude profile: %v\n", err)
+	} else {
+		claudeProfile = name
+	}
+
 	cs := &ChildState{}
 
 	// Open log database
@@ -509,14 +524,14 @@ func ChildSetup() (*ChildState, error) {
 						cs.Queue.Resolve(e.Domain, true)
 					}
 					rulesMu.Lock()
-					ruleset.AddRule(e.Domain, rules.Allow, "", rules.KindNetwork)
+					_ = ruleset.AddRule(e.Domain, rules.Allow, "", rules.KindNetwork)
 					rulesMu.Unlock()
 				case "deny":
 					if cs.Queue != nil {
 						cs.Queue.Resolve(e.Domain, false)
 					}
 					rulesMu.Lock()
-					ruleset.AddRule(e.Domain, rules.Deny, "", rules.KindNetwork)
+					_ = ruleset.AddRule(e.Domain, rules.Deny, "", rules.KindNetwork)
 					rulesMu.Unlock()
 				case "dnat":
 					if e.Port > 0 {
@@ -545,6 +560,7 @@ func ChildSetup() (*ChildState, error) {
 		Type:         "status",
 		Session:      log.SessionID(),
 		LearningMode: ruleset.LearningMode,
+		Profile:      claudeProfile,
 	})
 
 	// Start DNS resolver (upstream: slirp4netns DNS relay)
@@ -604,7 +620,11 @@ func ChildSetup() (*ChildState, error) {
 			// Block and wait for approval
 			queueDomain := domain
 			if queueDomain == "" {
-				queueDomain = c.Dest
+				if host, _, err := net.SplitHostPort(c.Dest); err == nil {
+					queueDomain = host
+				} else {
+					queueDomain = c.Dest
+				}
 			}
 			emitEvent(socket.Event{
 				Type: "approval", Domain: queueDomain, Dest: c.Dest,
@@ -726,9 +746,11 @@ func setupIp6tables() error {
 
 // overrideResolvConf bind-mounts a custom resolv.conf pointing to seki's DNS.
 func overrideResolvConf() error {
-	// Make mount namespace private to prevent propagation
-	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
-		return fmt.Errorf("make private: %w", err)
+	// Make /etc private so our bind mount on resolv.conf doesn't propagate.
+	// Only /etc — not / — to preserve MS_SHARED on /tmp etc. that Podman
+	// rootless port forwarding relies on.
+	if err := syscall.Mount("", "/etc", "", syscall.MS_PRIVATE, ""); err != nil {
+		return fmt.Errorf("make /etc private: %w", err)
 	}
 
 	// Write temp resolv.conf (use PID to avoid collisions)
@@ -851,6 +873,100 @@ func bindSSH() error {
 	return nil
 }
 
+// bindClaudeProfile bind-mounts a profile-specific .credentials.json over
+// ~/.claude/.credentials.json based on the project's working directory.
+// Returns the resolved profile name (empty if no profile applies).
+func bindClaudeProfile() (string, error) {
+	cwd := os.Getenv("SEKI_CWD")
+	if cwd == "" {
+		return "", nil
+	}
+
+	cfg, err := profile.LoadConfig()
+	if err != nil {
+		return "", fmt.Errorf("load config: %w", err)
+	}
+	if cfg == nil {
+		return "", nil
+	}
+
+	profileName := cfg.Resolve(cwd)
+	if profileName == "" {
+		return "", nil
+	}
+
+	home := os.Getenv("HOME")
+	if home == "" {
+		return "", nil
+	}
+
+	src, err := profile.CredentialsPath(profileName)
+	if err != nil {
+		return "", err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(src), 0755); err != nil {
+		return "", fmt.Errorf("mkdir profile dir: %w", err)
+	}
+	if _, err := os.Stat(src); os.IsNotExist(err) {
+		if err := os.WriteFile(src, []byte("{}\n"), 0600); err != nil {
+			return "", fmt.Errorf("init profile credentials: %w", err)
+		}
+	}
+
+	target := filepath.Join(home, ".claude", ".credentials.json")
+	if _, err := os.Stat(filepath.Dir(target)); err != nil {
+		return "", nil
+	}
+	if _, err := os.Stat(target); os.IsNotExist(err) {
+		if err := os.WriteFile(target, []byte("{}\n"), 0600); err != nil {
+			return "", fmt.Errorf("create target: %w", err)
+		}
+	}
+
+	if err := syscall.Mount(src, target, "", syscall.MS_BIND, ""); err != nil {
+		return "", fmt.Errorf("bind mount %s -> %s: %w", src, target, err)
+	}
+
+	fmt.Fprintf(os.Stderr, "seki: claude profile: %s\n", profileName)
+	return profileName, nil
+}
+
+// SyncBackCredentials copies ~/.claude/.credentials.json back to the
+// profile-specific path. Call this after the user command exits but before
+// the mount namespace is torn down — atomic writes (rename) inside the
+// sandbox detach the bind-mount, so the profile source file stays stale.
+func SyncBackCredentials() {
+	cwd := os.Getenv("SEKI_CWD")
+	if cwd == "" {
+		return
+	}
+	cfg, err := profile.LoadConfig()
+	if err != nil || cfg == nil {
+		return
+	}
+	profileName := cfg.Resolve(cwd)
+	if profileName == "" || profileName == cfg.Default {
+		return
+	}
+	home := os.Getenv("HOME")
+	if home == "" {
+		return
+	}
+	src := filepath.Join(home, ".claude", ".credentials.json")
+	data, err := os.ReadFile(src)
+	if err != nil || len(data) <= 4 {
+		return
+	}
+	dst, err := profile.CredentialsPath(profileName)
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(dst, data, 0600); err != nil {
+		fmt.Fprintf(os.Stderr, "seki: sync credentials back to %s: %v\n", profileName, err)
+	}
+}
+
 func run(name string, args ...string) error {
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
@@ -924,7 +1040,7 @@ func addPreroutingDNAT(port int) error {
 // It injects git credential helper config, filters conflicting GIT_CONFIG_* vars,
 // and strips secret environment variables referenced by credential config.
 // If sshProxyPath is non-empty, SSH_AUTH_SOCK is replaced with the proxy socket path.
-func buildChildEnv(sekiBin string, sshProxyPath string, secretKeys []string, subUID, subGID *SubIDRange) []string {
+func buildChildEnv(sekiBin string, sshProxyPath string, secretKeys []string, subUID, subGID *SubIDRange, sandboxEnv map[string]string) []string {
 	env := os.Environ()
 
 	// Build set of secret key prefixes for O(1) lookup.
@@ -972,6 +1088,9 @@ func buildChildEnv(sekiBin string, sshProxyPath string, secretKeys []string, sub
 	}
 	if v := subIDEnvValue(subUID, subGID); v != "" {
 		filtered = append(filtered, subIDEnvKey+"="+v)
+	}
+	for k, v := range sandboxEnv {
+		filtered = append(filtered, k+"="+v)
 	}
 	return filtered
 }
