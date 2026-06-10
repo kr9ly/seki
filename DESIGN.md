@@ -769,6 +769,76 @@ claude login
 - [ ] 起動時パーミッションチェック
 - [ ] ルール自動提案 (`seki log --suggest` 的な)
 
+## サービス宣言（sandbox 内常駐デーモン）
+
+### 概要
+
+`~/.config/seki/config.json` の `services` フィールドに、sandbox 起動時に内部で spawn するデーモンを宣言できる。
+宣言されたサービスはユーザーコマンドの前に起動し、ユーザーコマンド終了後に道連れで停止する。
+
+### config schema
+
+```json
+{
+  "sandbox_env": { "TESTCONTAINERS_RYUK_DISABLED": "true" },
+  "services": [
+    {
+      "name": "podman-api",
+      "command": ["podman", "system", "service", "--time=0"],
+      "ready_socket": "$XDG_RUNTIME_DIR/podman/podman.sock",
+      "ready_timeout_sec": 15,
+      "stop_command": ["podman", "stop", "--all", "--time", "5"],
+      "env": { "EXAMPLE": "per-service-override" }
+    }
+  ]
+}
+```
+
+| フィールド | 必須 | 説明 |
+|-----------|------|------|
+| `name` | yes | 識別子。ログファイル名 (`~/.cache/seki/services/<name>.log`) に使う |
+| `command` | yes | argv 配列。シェル経由にしない |
+| `ready_socket` | no | connect できるまで待つ unix socket パス。`os.ExpandEnv` で展開 |
+| `ready_timeout_sec` | no | readiness 待ちの上限（デフォルト 15s）。超えたら警告してそのまま続行 |
+| `stop_command` | no | SIGTERM の前に同期実行するクリーンアップコマンド（timeout 10s） |
+| `env` | no | サービス専用の追加環境変数 |
+
+### プロセスモデル（supervisor mode）
+
+services が宣言されている場合のみ動作が変わる。**services が空なら現行の syscall.Exec パスを完全維持**。
+
+```
+seki exec
+  └── seki __child (CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS)
+        └── seki __ns-exec (CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID ← services 宣言時のみ追加)
+              ├── service-1 (Setpgid=true, 独立 pgrp)
+              ├── service-2 (Setpgid=true)
+              └── user command (前景 pgrp, Ctrl-C 直達)
+```
+
+`__ns-exec` が pid 1 になることで:
+- supervisor 終了時に pid namespace 内の全プロセスへ SIGKILL（カーネル保証）
+- double-fork デーモン（conmon 等）も逃げられない
+- orphan の zombie reaping を pid 1 が担う（`syscall.Wait4(-1, ...)` ループ）
+
+### シャットダウンシーケンス
+
+ユーザーコマンド終了後、逆順で各サービスを停止:
+
+1. `stop_command` を同期実行（timeout 10s）
+2. サービスの pgid に SIGTERM
+3. 最大 5s 待つ → 残っていれば SIGKILL
+
+### サービスログ
+
+- `~/.cache/seki/services/<name>.log` に append（sandbox 終了後もデバッグ可能）
+- 起動時にタイムスタンプ付き開始マーカーを書く
+
+### フォールバック
+
+subuid が利用不可の環境（`ParseSubIDEnv` が nil を返す場合）は `__ns-exec` を経由しないため services 非対応。
+services が宣言されていても「subuid not available — services will not be started」と警告し、スキップする。
+
 ## 確定済み設計判断
 
 - ドメイン単位のネットワーク制御 (パス・メソッド・ボディは見ない)

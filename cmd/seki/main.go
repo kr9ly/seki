@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	"github.com/kr9ly/seki/internal/credential"
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/netns"
+	"github.com/kr9ly/seki/internal/profile"
 	"github.com/kr9ly/seki/internal/rules"
 	"github.com/kr9ly/seki/internal/socket"
 	"golang.org/x/sys/unix"
@@ -142,6 +144,12 @@ func cmdNsSetup() {
 // (CAP_SETUID, CAP_SETGID, CAP_SYS_ADMIN). It waits for uid_map to be set,
 // then sets up the namespace (tmpfs mounts, newuidmap wrapper, Podman config)
 // and execs the user command. Ambient caps survive all execs in the chain.
+//
+// When services are declared in the global config, cmdNsExec acts as a
+// supervisor instead of exec-ing the user command directly: it spawns the
+// declared services, waits for readiness, runs the user command as a child
+// process, then shuts the services down on exit. This keeps the no-services
+// path entirely unchanged.
 func cmdNsExec() {
 	args := argsAfterSep(os.Args[2:])
 	if len(args) == 0 {
@@ -191,16 +199,262 @@ func cmdNsExec() {
 	// Ensure Podman config files exist
 	setupPodmanConfig()
 
-	// Exec user command (ambient caps survive this exec)
-	path, err := exec.LookPath(args[0])
+	// Load global config to check for service declarations.
+	// Filter services by the sandbox's cwd (SEKI_CWD) using match patterns.
+	// If the filtered list is empty, behave identically to no services declared.
+	gc, err := profile.LoadGlobalConfig()
+	var activeServices []profile.Service
+	if err == nil && len(gc.Services) > 0 {
+		cwd := os.Getenv("SEKI_CWD")
+		activeServices = profile.MatchServices(cwd, gc.Services)
+	}
+
+	if len(activeServices) == 0 {
+		// No applicable services (or config error) — keep the original exec path unchanged.
+		path, err := exec.LookPath(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki __ns-exec: %v\n", err)
+			os.Exit(127)
+		}
+		if err := syscall.Exec(path, args, os.Environ()); err != nil {
+			fmt.Fprintf(os.Stderr, "seki __ns-exec: exec %v: %v\n", args[0], err)
+			os.Exit(1)
+		}
+		return // unreachable but keeps the compiler happy
+	}
+
+	// When CLONE_NEWPID was used (set by cmdChild when services are declared),
+	// this process is pid 1 in the new pid namespace. Remount /proc so that
+	// ps, procfs tools, and Podman see this namespace's pids rather than the
+	// outer one.
+	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+		// Non-fatal: only happens when CLONE_NEWPID was not set (e.g. during
+		// unit tests or if the parent omitted it), so we warn and continue.
+		fmt.Fprintf(os.Stderr, "seki __ns-exec: remount /proc: %v\n", err)
+	}
+
+	// Supervisor mode: spawn services, run user command, then shut down.
+	os.Exit(runSupervisor(args, activeServices))
+}
+
+// svcState tracks a running service spawned by the supervisor.
+type svcState struct {
+	svc profile.Service
+	cmd *exec.Cmd
+	pid int
+}
+
+// runSupervisor starts the declared services, runs the user command as a child
+// process (not exec), waits for all children reaping as pid 1, then shuts
+// down the services in reverse order. Returns the user command's exit code.
+func runSupervisor(userArgs []string, services []profile.Service) int {
+	// ---- start services ----
+	started := make([]svcState, 0, len(services))
+
+	for _, svc := range services {
+		if len(svc.Command) == 0 {
+			fmt.Fprintf(os.Stderr, "seki supervisor: service %q has empty command, skipping\n", svc.Name)
+			continue
+		}
+		logFile, err := openServiceLog(svc.Name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki supervisor: open log for %q: %v\n", svc.Name, err)
+		}
+
+		env := os.Environ()
+		for k, v := range svc.Env {
+			env = append(env, k+"="+v)
+		}
+
+		cmd := exec.Command(svc.Command[0], svc.Command[1:]...)
+		cmd.Env = env
+		if logFile != nil {
+			cmd.Stdout = logFile
+			cmd.Stderr = logFile
+		} else {
+			cmd.Stdout = io.Discard
+			cmd.Stderr = io.Discard
+		}
+		// Each service gets its own process group so we can send SIGTERM/SIGKILL
+		// to the whole group cleanly.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+		if err := cmd.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "seki supervisor: start service %q: %v\n", svc.Name, err)
+			if logFile != nil {
+				logFile.Close()
+			}
+			continue
+		}
+		if logFile != nil {
+			logFile.Close() // child has inherited the fd; we can close our copy
+		}
+		started = append(started, svcState{svc: svc, cmd: cmd, pid: cmd.Process.Pid})
+	}
+
+	// ---- wait for readiness ----
+	for _, st := range started {
+		if st.svc.ReadySocket == "" {
+			continue
+		}
+		sockPath := os.ExpandEnv(st.svc.ReadySocket)
+		timeout := st.svc.ReadyTimeoutSec
+		if timeout <= 0 {
+			timeout = 15
+		}
+		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+		ready := false
+		for time.Now().Before(deadline) {
+			conn, err := net.Dial("unix", sockPath)
+			if err == nil {
+				conn.Close()
+				ready = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !ready {
+			fmt.Fprintf(os.Stderr, "seki supervisor: service %q not ready after %ds (continuing)\n",
+				st.svc.Name, timeout)
+		}
+	}
+
+	// ---- start user command ----
+	userPath, err := exec.LookPath(userArgs[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "seki __ns-exec: %v\n", err)
-		os.Exit(127)
+		// Shut down services even if user command cannot start.
+		shutdownServices(started)
+		return 127
 	}
-	if err := syscall.Exec(path, args, os.Environ()); err != nil {
-		fmt.Fprintf(os.Stderr, "seki __ns-exec: exec %v: %v\n", args[0], err)
-		os.Exit(1)
+	userCmd := exec.Command(userPath, userArgs[1:]...)
+	userCmd.Stdin = os.Stdin
+	userCmd.Stdout = os.Stdout
+	userCmd.Stderr = os.Stderr
+	userCmd.Env = os.Environ()
+	// No Setpgid: user command shares the foreground pgrp so Ctrl-C reaches it.
+
+	// As pid 1 we must reap all orphans ourselves. Use Start + manual Wait4 loop
+	// rather than cmd.Wait() to avoid racing with the zombie reaping loop.
+	if err := userCmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "seki __ns-exec: start user command: %v\n", err)
+		shutdownServices(started)
+		return 1
 	}
+	userPid := userCmd.Process.Pid
+
+	// Handle SIGTERM: forward to user command; ignore SIGINT (it goes to the
+	// foreground pgrp which already includes the user command).
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM)
+	signal.Ignore(syscall.SIGINT)
+	go func() {
+		for sig := range sigCh {
+			userCmd.Process.Signal(sig)
+		}
+	}()
+
+	// ---- pid-1 zombie reaping loop ----
+	userExitCode := 0
+	svcPids := make(map[int]string, len(started)) // pid → name
+	for _, st := range started {
+		svcPids[st.pid] = st.svc.Name
+	}
+
+	for {
+		var wstatus syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &wstatus, 0, nil)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			// ECHILD: no more children
+			break
+		}
+		if pid == userPid {
+			if wstatus.Exited() {
+				userExitCode = wstatus.ExitStatus()
+			} else if wstatus.Signaled() {
+				userExitCode = 128 + int(wstatus.Signal())
+			}
+			// User command has exited — begin shutdown.
+			break
+		}
+		if name, ok := svcPids[pid]; ok {
+			if !wstatus.Exited() || wstatus.ExitStatus() != 0 {
+				fmt.Fprintf(os.Stderr, "seki supervisor: service %q exited unexpectedly (status %v)\n",
+					name, wstatus)
+			}
+		}
+	}
+
+	signal.Stop(sigCh)
+	close(sigCh)
+
+	shutdownServices(started)
+	return userExitCode
+}
+
+// shutdownServices stops the started services in reverse order.
+func shutdownServices(started []svcState) {
+	for i := len(started) - 1; i >= 0; i-- {
+		st := started[i]
+		// Run optional stop_command first (e.g. "podman stop --all").
+		if len(st.svc.StopCommand) > 0 {
+			stopCtx := exec.Command(st.svc.StopCommand[0], st.svc.StopCommand[1:]...)
+			stopCtx.Stdout = io.Discard
+			stopCtx.Stderr = os.Stderr
+			done := make(chan error, 1)
+			if err := stopCtx.Start(); err == nil {
+				go func() { done <- stopCtx.Wait() }()
+				select {
+				case <-done:
+				case <-time.After(10 * time.Second):
+					stopCtx.Process.Kill()
+				}
+			}
+		}
+
+		pgid := -st.pid // negative pgid = process group of st.pid
+		// SIGTERM to the service's process group.
+		syscall.Kill(pgid, syscall.SIGTERM)
+
+		// Wait up to 5s for the service to exit.
+		terminated := make(chan struct{})
+		go func(cmd *exec.Cmd) {
+			cmd.Wait() //nolint:errcheck
+			close(terminated)
+		}(st.cmd)
+
+		select {
+		case <-terminated:
+		case <-time.After(5 * time.Second):
+			// Still running — force kill.
+			syscall.Kill(pgid, syscall.SIGKILL)
+			<-terminated
+		}
+	}
+}
+
+// openServiceLog opens (or creates) the log file for a service under
+// ~/.cache/seki/services/<name>.log. Returns nil on error (caller logs).
+func openServiceLog(name string) (*os.File, error) {
+	home := os.Getenv("HOME")
+	if home == "" {
+		return nil, fmt.Errorf("HOME not set")
+	}
+	dir := filepath.Join(home, ".cache", "seki", "services")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+	logPath := filepath.Join(dir, name+".log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	// Write a start marker so log lines from different sessions are separated.
+	fmt.Fprintf(f, "\n--- seki service %q started at %s ---\n", name, time.Now().Format(time.RFC3339))
+	return f, nil
 }
 
 func cmdChild() {
@@ -227,6 +481,25 @@ func cmdChild() {
 	subUID, subGID := netns.ParseSubIDEnv()
 	useSubIDs := subUID != nil && subGID != nil
 
+	// Check whether services apply for this cwd so we can add CLONE_NEWPID.
+	// Config errors are non-fatal: treat as no services.
+	// Use the same MatchServices filter as cmdNsExec so the two sides agree.
+	gc, _ := profile.LoadGlobalConfig()
+	var activeServices []profile.Service
+	if gc != nil && len(gc.Services) > 0 {
+		cwd := os.Getenv("SEKI_CWD")
+		activeServices = profile.MatchServices(cwd, gc.Services)
+	}
+	hasServices := len(activeServices) > 0
+
+	if !useSubIDs && hasServices {
+		// Services require the __ns-exec supervisor path (which adds /proc remount
+		// and the zombie-reaping loop). The no-subuid path does not go through
+		// __ns-exec, so it cannot host services.
+		fmt.Fprintf(os.Stderr, "seki: subuid not available — services will not be started\n")
+		hasServices = false
+	}
+
 	if useSubIDs {
 		// Multi-entry uid_map: use __ns-exec to wait for parent's direct
 		// write, then re-exec to gain capabilities for the user command.
@@ -248,9 +521,18 @@ func cmdChild() {
 		cmd.Stderr = os.Stderr
 		cmd.Env = append(os.Environ(), "SEKI_ACTIVE=1")
 		cmd.ExtraFiles = []*os.File{mapReadyPr} // fd 3 = mapReady
+
+		cloneFlags := uintptr(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS)
+		if hasServices {
+			// Add CLONE_NEWPID so the supervisor (__ns-exec) becomes pid 1.
+			// When the supervisor exits, the kernel sends SIGKILL to all remaining
+			// processes in the namespace — double-fork daemons cannot escape.
+			cloneFlags |= syscall.CLONE_NEWPID
+		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			// CLONE_NEWNS: needed for tmpfs mounts and bind-mounting newuidmap wrapper
-			Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+			// CLONE_NEWPID (conditional): supervisor mode — orphan reaping + kill-on-exit
+			Cloneflags: cloneFlags,
 			// Ambient caps survive exec: the user command (and Podman, and our
 			// newuidmap wrapper) all inherit these capabilities.
 			AmbientCaps: []uintptr{
