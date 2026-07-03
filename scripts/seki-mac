@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# seki-mac — Mac から seki sandbox 内の Claude Code をワンコマンドで起動する
+#
+# Apple container の Container Machine (軽量 Linux VM) を裏で用意し、
+# その中で seki exec -- claude を立ち上げる。マシンが無ければ作成し、
+# ミドルウェア (slirp4netns / iptables / seki / Claude Code) を自動投入する。
+#
+# Container Machine は Mac の $HOME を read-write で自動マウントするため、
+# sandbox 内の Claude Code は Mac 上のリポジトリを直接読み書きできる。
+# seki が制限するのはネットワーク出口だけで、ファイルアクセスは制限しない。
+#
+# 使い方:
+#   seki-mac                  # カレントディレクトリで claude を sandbox 起動
+#   seki-mac watch            # 監視 UI (別ターミナルで)
+#   seki-mac shell            # マシン内シェル (カレントディレクトリ)
+#   seki-mac provision        # ミドルウェアの再投入 (seki 更新時など)
+#
+# カスタマイズ (環境変数):
+#   SEKI_MACHINE      マシン名        (default: seki-dev)
+#   SEKI_IMAGE        ベースイメージ  (default: ubuntu:24.04)
+#   SEKI_CPUS         CPU 数          (default: 4)
+#   SEKI_MEMORY       メモリ          (default: 8G)
+set -euo pipefail
+
+MACHINE="${SEKI_MACHINE:-seki-dev}"
+IMAGE="${SEKI_IMAGE:-ubuntu:24.04}"
+CPUS="${SEKI_CPUS:-4}"
+MEMORY="${SEKI_MEMORY:-8G}"
+
+CACHE_DIR="$HOME/.cache/seki"
+SUB="${1:-claude}"
+
+die() { echo "seki-mac: $*" >&2; exit 1; }
+
+command -v container >/dev/null 2>&1 \
+  || die "apple/container が見つからない。https://github.com/apple/container/releases から installer pkg を入れること"
+
+# --- container システムサービス起動 (冪等) ---
+container system status >/dev/null 2>&1 || container system start
+
+# --- マシンが無ければ作成 + 初回 provision ---
+provision() {
+  mkdir -p "$CACHE_DIR"
+  # 共有ホーム経由でスクリプトを渡す。マシンローカル (/usr/local, /usr) に
+  # インストールするのは、共有 ~/.local/bin に置くと Mac 側の darwin バイナリと
+  # 衝突するため (特に claude)。
+  cat > "$CACHE_DIR/provision.sh" <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+sudo apt-get update -qq
+sudo apt-get install -y -qq slirp4netns iptables ca-certificates curl
+
+# AppArmor の非特権 userns 制限を解除 (Apple container の VM カーネルには
+# AppArmor 自体が無いので通常 no-op。Lima 等の標準 Ubuntu カーネル用)
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' \
+  | sudo tee /etc/sysctl.d/99-seki.conf >/dev/null
+
+# seki バイナリ (linux 用) — マシンローカルに配置
+arch="$(uname -m)"
+case "$arch" in
+  aarch64) asset=seki-linux-arm64 ;;
+  x86_64)  asset=seki-linux-amd64 ;;
+  *) echo "unsupported arch: $arch" >&2; exit 1 ;;
+esac
+curl -fsSL -o /tmp/seki "https://github.com/kr9ly/seki/releases/latest/download/$asset"
+sudo install -m755 /tmp/seki /usr/local/bin/seki
+
+# Node.js + Claude Code — npm -g でマシンローカルに配置
+if ! command -v node >/dev/null 2>&1 || [ "$(node -e 'console.log(process.versions.node.split(".")[0])')" -lt 18 ]; then
+  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - >/dev/null
+  sudo apt-get install -y -qq nodejs
+fi
+sudo npm install -g --quiet @anthropic-ai/claude-code
+
+echo "provision done: $(seki 2>&1 | head -1 || true)"
+EOS
+  chmod +x "$CACHE_DIR/provision.sh"
+  container machine run -n "$MACHINE" bash "$CACHE_DIR/provision.sh"
+}
+
+if ! container machine ls 2>/dev/null | awk '{print $1}' | grep -qx "$MACHINE"; then
+  echo "seki-mac: マシン $MACHINE を作成中 ($IMAGE, cpus=$CPUS, memory=$MEMORY)"
+  container machine create "$IMAGE" --name "$MACHINE"
+  container machine set -n "$MACHINE" "cpus=$CPUS" "memory=$MEMORY"
+  provision
+fi
+
+# --- マシン内で実行するエントリスクリプト (共有ホーム経由) ---
+mkdir -p "$CACHE_DIR"
+cat > "$CACHE_DIR/enter.sh" <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+sub="$1"; workdir="$2"
+
+# 共有 ~/.local/bin の darwin 版 claude を踏まないよう、マシンローカルを優先
+claude_bin="$(PATH=/usr/local/bin:/usr/bin command -v claude || command -v claude)" \
+  || { echo "claude が見つからない。seki-mac provision を実行" >&2; exit 1; }
+
+cd "$workdir"
+case "$sub" in
+  claude) exec seki exec -- "$claude_bin" ;;
+  watch)  exec seki watch ;;
+  shell)  exec bash -i ;;
+  *) echo "unknown subcommand: $sub" >&2; exit 1 ;;
+esac
+EOS
+chmod +x "$CACHE_DIR/enter.sh"
+
+case "$SUB" in
+  provision) provision ;;
+  claude|watch|shell)
+    [[ "$PWD" == "$HOME"* ]] \
+      || die "カレントディレクトリが \$HOME 配下にない。共有マウントは \$HOME のみ: $PWD"
+    exec container machine run -n "$MACHINE" bash "$CACHE_DIR/enter.sh" "$SUB" "$PWD"
+    ;;
+  *) die "unknown subcommand: $SUB (claude|watch|shell|provision)" ;;
+esac

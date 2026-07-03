@@ -27,6 +27,41 @@ Apple container 同梱カーネルの config は確認済みで、seki の要求
 
 macOS 26 未満 / Intel Mac の場合は [Lima フォールバック](#lima-フォールバックmacos-26-未満--intel-mac) を参照。
 
+## ワンコマンド起動（seki-mac）
+
+手動セットアップの代わりに、[`scripts/seki-mac`](../scripts/seki-mac) を Mac に置けば
+マシン作成・ミドルウェア投入・起動まで一発で通る:
+
+```bash
+curl -fsSL -o ~/.local/bin/seki-mac \
+  https://github.com/kr9ly/seki/releases/latest/download/seki-mac
+chmod +x ~/.local/bin/seki-mac
+
+cd ~/projects/myapp
+seki-mac              # sandbox 内で claude 起動（初回はマシン作成 + provision）
+seki-mac watch        # 別ターミナルで監視 UI
+seki-mac shell        # マシン内シェル
+seki-mac provision    # ミドルウェア再投入（seki 更新時など）
+```
+
+初回はマシン作成 + apt + Node/Claude Code インストールで数分かかる。2 回目以降は即起動。
+マシン名やリソースは `SEKI_MACHINE` / `SEKI_CPUS` / `SEKI_MEMORY` 環境変数で変えられる。
+以下のセットアップ手順は、seki-mac が中でやっていることの手動版 + 解説である。
+
+## ホストファイルへのアクセス
+
+**sandbox 内から Mac のファイルは自由に読み書きできる。**
+
+- Container Machine は Mac の `$HOME` を read-write で自動マウントする
+  （マシン内でも同じ `/Users/<username>` パスで見える）
+- seki の sandbox はネットワーク出口だけを制御し、ファイルシステムは制限しない。
+  これは設計判断（DESIGN.md 参照）: 守るべきは情報の流出であって、ローカルファイルの
+  破壊は git で復元できる。ファイルを読まれても、ネットワーク出口が塞がれていれば流出しない
+
+つまり Mac 側のエディタで開いているリポジトリを、sandbox 内の Claude Code が
+そのまま編集する。パス変換も同期も不要。
+ただし共有されるのは `$HOME` 配下のみ（`seki-mac` は `$HOME` 外のディレクトリでの起動を拒否する）。
+
 ## セットアップ
 
 ### 1. Apple container のインストール
