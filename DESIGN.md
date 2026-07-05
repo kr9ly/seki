@@ -689,13 +689,17 @@ host 側 (実体)                                 sandbox 内 (bind-mount)
 seki のグローバル設定でプロジェクトパス → プロファイルの対応を定義する。
 glob パターンと default フォールバックで、新規プロジェクト追加時の手間を最小化する。
 
-```yaml
-# ~/.config/seki/config.yaml (または既存の設定ファイルに統合)
-claude_profiles:
-  default: personal
-  projects:
-    /home/kr9ly/projects/kurashiru-*: work
-    /home/kr9ly/projects/nell-*: work
+```jsonc
+// ~/.config/seki/config.json
+{
+  "claude_profiles": {
+    "default": "personal",
+    "projects": [
+      { "match": "/home/kr9ly/projects/kurashiru-*", "profile": "work" },
+      { "match": "/home/kr9ly/projects/nell-*", "profile": "work" }
+    ]
+  }
+}
 ```
 
 **マッチングルール:**
