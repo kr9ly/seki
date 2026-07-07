@@ -898,9 +898,12 @@ credential helper proxy、SSH agent proxy、環境変数フィルタ、SQLite �
 
 ```
 User process (Seatbelt 内)
-  → HTTPS_PROXY=127.0.0.1:10200 に従い CONNECT example.com:443
-  → seki プロキシ: CONNECT のホスト名 + TLS ClientHello の SNI でルール評価
-  → allow: 実接続して bidirectional relay / deny: 407 + 接続切断
+  → HTTPS_PROXY=127.0.0.1:<port> に従い CONNECT example.com:443
+  → seki プロキシ: CONNECT のホスト名でルール評価
+  → allow: 200 を返しトンネル確立 → TLS ClientHello を peek し、SNI が CONNECT
+    ホストと異なる場合（ドメインフロンティング）は SNI で再評価
+  → deny: トンネル確立前なら 403 Forbidden（クライアントに理由が見える）、
+    確立後（SNI 再評価）なら接続切断
   → PostToolUse hook でブロック理由をエージェントに注入（Linux 版と共通）
 
 User process が直接 connect を試みた場合
@@ -920,24 +923,30 @@ darwin では DNS 検問を独立レイヤーとして持たず、**プロキシ
 ### ソケット信頼検証（darwin）
 
 Linux 版は SO_PEERCRED + user namespace 比較で sandbox 内からの approve をドロップする。
-darwin 版は 2 段構え:
+darwin では sandbox プロセスがホストと同一 euid で走るため、peer credential では
+watch と sandbox を区別できない。そこで**ソケット自体を 2 本に分離**する:
 
-1. Seatbelt profile で watch/control ソケットのパスへの接続を deny — sandbox 内から
-   そもそも届かない（機構としてはこちらが本体）
-2. LOCAL_PEERCRED で euid を検証（多層防御）
+1. **制御ソケット**（`seki-<pid>.sock`）— watch 専用。Seatbelt profile がパスへの
+   接続を deny するため sandbox 内から届かない（機構としてはこちらが本体）。
+   LOCAL_PEERCRED の euid 検証は他ユーザーに対する多層防御
+2. **イベントソケット**（`seki-sb-<pid>.sock`）— sandbox 内の hooks / emit 用。
+   `SEKI_SOCK` はこちらを指す。接続は常に untrusted 扱いで、approve/deny 等の
+   制御イベントはドロップされる（イベント送信と rebroadcast 受信のみ可能）
 
 ### SSH
 
-ssh はプロキシ環境変数を見ないため、`ProxyCommand` で seki 経由に固定する:
+ssh はプロキシ環境変数を見ないため、`ProxyCommand` で seki 経由に固定する。
+darwin には mount namespace がなく .ssh/config のコピーベース差し替えができないので、
+環境変数で git のみに注入する:
 
 ```
-# seki が配置する .ssh/config（既存のコピーベース配置に追記）
-Host *
-    ProxyCommand seki proxy-connect %h %p
+GIT_SSH_COMMAND=ssh -o ProxyCommand="seki proxy-connect %h %p"
 ```
 
-`seki proxy-connect` は stdio ↔ seki プロキシの relay。ルール評価はホスト名ベースで
-プロキシ側に乗る。SSH agent proxy（署名転送）は Linux 版と共通。
+`seki proxy-connect` は stdio ↔ seki プロキシ（CONNECT）の relay。ルール評価は
+ホスト名ベースでプロキシ側に乗る。SSH agent proxy（署名転送）は Linux 版と共通。
+git 以外の直接の ssh 実行はプロキシを知らないため Seatbelt に落とされる
+（ユーザーが手動で `-o ProxyCommand="seki proxy-connect %h %p"` を付ければ通る）。
 
 ### 失うもの・トレードオフ
 
@@ -957,7 +966,15 @@ Host *
   （Seatbelt は `/usr/bin/sandbox-exec` の exec で使い、libsandbox にリンクしない）
 - seki-mac ランチャーと docs/macos.md の VM 手順は deprecated
 
-### スパイク計画（実装前に検証する前提）
+### 実装状態（2026-07）
+
+darwin backend は実装済み（`internal/sandbox/backend_darwin.go`、CONNECT プロキシは
+`internal/proxy/connect.go`、profile 生成は `internal/seatbelt`）。プラットフォーム
+中立な部分（CONNECT トンネル、ルール評価、SNI 再評価、absolute-URI HTTP、profile
+生成）は Linux 上のユニットテストで検証済み。**Seatbelt の実挙動は Mac 実機で未検証**
+— 下記スパイクが通るまでこの backend は信頼できない。
+
+### スパイク計画（Mac 実機で検証する前提）
 
 リスク順。1 つでも落ちたら方式を再交渉する:
 

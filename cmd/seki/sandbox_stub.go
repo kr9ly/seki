@@ -1,8 +1,7 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 // Stubs for platform-specific commands on platforms without a sandbox
-// backend implementation. The darwin backend (Seatbelt + explicit proxy)
-// is designed but not implemented — see DESIGN.md.
+// backend implementation.
 
 package main
 
@@ -12,7 +11,7 @@ import (
 )
 
 func platformUnsupported(cmd string) {
-	fmt.Fprintf(os.Stderr, "seki %s: not supported on this platform (darwin backend not implemented — see DESIGN.md)\n", cmd)
+	fmt.Fprintf(os.Stderr, "seki %s: not supported on this platform\n", cmd)
 	os.Exit(1)
 }
 

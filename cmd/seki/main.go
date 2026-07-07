@@ -72,6 +72,8 @@ func main() {
 		cmdEmit()
 	case "forward":
 		cmdForward()
+	case "proxy-connect":
+		cmdProxyConnect()
 	case "host-port":
 		cmdHostPort()
 	default:

@@ -1,12 +1,10 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package sandbox
 
 import "fmt"
 
-// stubBackend is a placeholder on platforms without an isolation backend yet.
-// The darwin backend (Seatbelt + explicit proxy) is designed in DESIGN.md
-// "macOS ネイティブ対応（darwin backend）" but not implemented.
+// stubBackend is a placeholder on platforms without an isolation backend.
 type stubBackend struct{}
 
 func platformBackend() Backend {

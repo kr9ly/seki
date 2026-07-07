@@ -14,13 +14,13 @@ import (
 
 // Event is a real-time notification exchanged between seki components.
 type Event struct {
-	Type    string `json:"type"`              // "dns", "tcp", "status", "approval", "approve", "deny", "cmd", "cmd_approval", "cmd_approve", "cmd_deny"
+	Type    string `json:"type"` // "dns", "tcp", "status", "approval", "approve", "deny", "cmd", "cmd_approval", "cmd_approve", "cmd_deny"
 	Time    string `json:"time,omitempty"`
 	Domain  string `json:"domain,omitempty"`
 	QType   string `json:"qtype,omitempty"`
 	Dest    string `json:"dest,omitempty"`
 	SNI     string `json:"sni,omitempty"`
-	Action  string `json:"action,omitempty"`  // "allow", "deny", "prompt"
+	Action  string `json:"action,omitempty"` // "allow", "deny", "prompt"
 	Tag     string `json:"tag,omitempty"`
 	Learned bool   `json:"learned,omitempty"` // would deny in learning mode
 	Command string `json:"command,omitempty"` // command string (for cmd events)
@@ -35,8 +35,8 @@ type Event struct {
 	Port      int    `json:"port,omitempty"`
 	HostPort  int    `json:"host_port,omitempty"`
 	ForwardID int    `json:"forward_id,omitempty"`
-	Error   string `json:"error,omitempty"`
-	Message string `json:"message,omitempty"` // free-form log message (for emit events)
+	Error     string `json:"error,omitempty"`
+	Message   string `json:"message,omitempty"` // free-form log message (for emit events)
 }
 
 // MessageFunc is called when a message is received from a watch client.
@@ -45,13 +45,15 @@ type MessageFunc func(Event)
 // Server streams events to connected watch clients via a Unix socket.
 // It also reads messages from clients (bidirectional).
 type Server struct {
-	path        string
-	ln          net.Listener
-	clients     []net.Conn
-	mu          sync.Mutex
-	onMessage   MessageFunc
-	hostUserNS  string           // host user namespace inode for trust check
-	clientTrust map[net.Conn]bool // true = trusted (same user NS as host)
+	path          string
+	ln            net.Listener
+	untrustedPath string
+	untrustedLn   net.Listener
+	clients       []net.Conn
+	mu            sync.Mutex
+	onMessage     MessageFunc
+	hostUserNS    string            // host user namespace inode for trust check
+	clientTrust   map[net.Conn]bool // true = trusted (same user NS as host)
 }
 
 // NewServer creates a socket server at ~/.config/seki/seki.sock.
@@ -70,8 +72,32 @@ func NewServer() (*Server, error) {
 	os.Chmod(path, 0660)
 
 	s := &Server{path: path, ln: ln, clientTrust: make(map[net.Conn]bool)}
-	go s.accept()
+	go s.acceptOn(ln, true)
 	return s, nil
+}
+
+// ListenUntrusted adds a second listener whose connections are always
+// treated as untrusted regardless of peer credentials: they receive event
+// broadcasts and may send non-control events (cmd_approval, emit, forward),
+// but control events (approve/deny) are dropped.
+//
+// The darwin backend exposes this listener to the sandbox (SEKI_SOCK points
+// here) while the Seatbelt profile denies the primary socket path — on
+// darwin the sandbox shares the host euid, so peer credentials cannot
+// distinguish it from watch and the split must happen at the path level.
+func (s *Server) ListenUntrusted(path string) error {
+	os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", path, err)
+	}
+	os.Chmod(path, 0660)
+	s.mu.Lock()
+	s.untrustedPath = path
+	s.untrustedLn = ln
+	s.mu.Unlock()
+	go s.acceptOn(ln, false)
+	return nil
 }
 
 // SetHostUserNS sets the host user namespace inode string for connection trust
@@ -125,16 +151,20 @@ func (s *Server) Close() error {
 
 	err := s.ln.Close()
 	os.Remove(s.path)
+	if s.untrustedLn != nil {
+		s.untrustedLn.Close()
+		os.Remove(s.untrustedPath)
+	}
 	return err
 }
 
-func (s *Server) accept() {
+func (s *Server) acceptOn(ln net.Listener, checkTrust bool) {
 	for {
-		conn, err := s.ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		trusted := s.checkTrust(conn)
+		trusted := checkTrust && s.checkTrust(conn)
 		s.mu.Lock()
 		s.clients = append(s.clients, conn)
 		s.clientTrust[conn] = trusted
@@ -288,9 +318,11 @@ func SockGlob() ([]string, error) {
 
 	var alive []string
 	for _, path := range matches {
-		// Skip non-event sockets (credential, SSH agent)
+		// Skip non-event sockets (credential, SSH agent) and the darwin
+		// sandbox-facing listener (watch must use the control socket).
 		base := filepath.Base(path)
-		if strings.HasPrefix(base, "seki-cred-") || strings.HasPrefix(base, "seki-ssh-") {
+		if strings.HasPrefix(base, "seki-cred-") || strings.HasPrefix(base, "seki-ssh-") ||
+			strings.HasPrefix(base, "seki-sb-") {
 			continue
 		}
 		conn, err := net.Dial("unix", path)
