@@ -17,6 +17,9 @@ func enableRawMode() (*unix.Termios, error) {
 	}
 	newState := *oldState
 	newState.Lflag &^= unix.ICANON | unix.ECHO
+	// Disable XON/XOFF flow control: an accidental Ctrl+S stops terminal
+	// output and freezes the whole watch TUI on blocked writes.
+	newState.Iflag &^= unix.IXON
 	newState.Cc[unix.VMIN] = 1
 	newState.Cc[unix.VTIME] = 0
 	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &newState); err != nil {
