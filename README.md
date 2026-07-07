@@ -3,7 +3,9 @@
 Claude Code の全アウトバウンド通信を DNS+SNI で検問するネットワークサンドボックス。
 このドキュメントは新環境のセットアップガイド。インストール → 設定ファイル配置 →
 learning mode で観察 → enforce 移行、の順に進める。
-設計の背景は [DESIGN.md](DESIGN.md)、Mac は [docs/macos.md](docs/macos.md) を参照。
+設計の背景は [DESIGN.md](DESIGN.md) を参照。現時点で対応環境は Linux のみ。
+Mac ネイティブ対応（Seatbelt backend）は設計済み・実装前 — DESIGN.md「macOS ネイティブ対応」を参照
+（旧 VM アプローチ [docs/macos.md](docs/macos.md) は破棄）。
 
 ## 1. インストール
 

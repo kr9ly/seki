@@ -1,5 +1,16 @@
 # seki を Mac で使う
 
+> **⚠️ このアプローチは破棄された（2026-07）**
+>
+> 本ドキュメントの Apple container / seki-mac 方式（Linux VM 内で seki + Claude を動かす）は、
+> 開発環境として成立しないと判断し破棄した。ワーキングツリーが常に共有 FS 上に置かれること、
+> VM 内の構成管理が Mac 側と二重化すること、iOS ビルド・Safari 検証等の darwin ネイティブ
+> 開発が射程外になることが理由。
+>
+> 後継は **darwin ネイティブバイナリ + Seatbelt (sandbox-exec) + 明示プロキシ** の
+> darwin backend。設計は [DESIGN.md「macOS ネイティブ対応（darwin backend）」](../DESIGN.md#macos-ネイティブ対応darwin-backend) を参照。
+> 以下は歴史的経緯として残す。
+
 ## 結論
 
 seki のネットワーク隔離は Linux 固有機構の上に建っている:

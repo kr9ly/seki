@@ -843,6 +843,135 @@ seki exec
 subuid が利用不可の環境（`ParseSubIDEnv` が nil を返す場合）は `__ns-exec` を経由しないため services 非対応。
 services が宣言されていても「subuid not available — services will not be started」と警告し、スキップする。
 
+## macOS ネイティブ対応（darwin backend）
+
+### 背景: VM アプローチの破棄
+
+v0.1.0 で Apple container の Linux VM 内で seki を動かす方式（seki-mac、docs/macos.md）を
+リリースしたが、**開発環境として成立しない**と判断し破棄する:
+
+- ワーキングツリーが常に共有ファイルシステム上に置かれる。virtiofs 越しの I/O 性能に加え、
+  VM 内で作った linux/arm64 アーティファクト（node_modules、ビルドキャッシュ）と
+  Mac 側ツール（エディタ LSP 等）が同じツリー上で衝突する
+- VM 内の構成管理が Mac 側（homebrew）と二重化する。Mac ユーザーに
+  「VM 内にもう一つの開発環境を維持しろ」と要求することになる
+- darwin ネイティブが必要な開発（iOS ビルド、Safari 検証）が原理的に射程外
+
+結論: Mac 対応 = **darwin ネイティブバイナリ + macOS の隔離機構**でなければならない。
+
+### 方式の選択
+
+Linux 版の依存機構を macOS で代替する選択肢は 3 つ:
+
+| 方式 | 透過性 | rootless | 配布 | 判定 |
+|------|--------|----------|------|------|
+| Network Extension (NEFilterDataProvider) | ○ プロセス単位で OS レベルフィルタ | △ ユーザー承認は GUI | ✗ 署名済み System Extension + entitlement + app bundle 必須 | 棚上げ（配布を本格化する段階で再検討） |
+| PF (pfctl) | ○ UID 単位で rdr 可能 | ✗ sudo 必須 + システムワイド設定変更 | ○ | 不採用（「ホスト無変更」の設計判断に反する） |
+| **Seatbelt (sandbox-exec) + 明示プロキシ** | △ プロキシ環境変数への協力が前提 | ○ | ○ シングルバイナリ維持 | **採用** |
+
+Seatbelt 方式の骨子: sandbox profile で**外向きネットワークを全 deny し、localhost の
+seki プロキシへの接続だけを allow** する。プロセスには `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` で
+プロキシを教える。協力的なプロセスはプロキシ経由で検問を通り、迂回を試みるプロセスは
+Seatbelt が接続自体を拒否する。「検問を通らない通信は存在できない」という不変条件は
+透過モデルと同じ強度で維持される。
+
+`sandbox-exec` は deprecated 扱いだが、Bazel や Anthropic の sandbox-runtime が
+現役で同じ構成（Seatbelt + プロキシ強制）を使っており、事実上の安定 API。
+
+### 機構マッピング（Linux → darwin）
+
+| Linux backend | darwin backend |
+|---------------|----------------|
+| user / net / mount namespace | Seatbelt profile（プロセス単位 deny-all） |
+| iptables REDIRECT + SO_ORIGINAL_DST | 明示プロキシ（HTTP CONNECT）+ プロキシ環境変数 |
+| slirp4netns | 不要（ホストネットワークを直接使用、出口はプロキシのみ） |
+| DNS リゾルバ検問（:5353 DNAT） | プロキシ側ホスト名解決に統合（下記） |
+| SO_PEERCRED + user ns 比較 | LOCAL_PEERCRED + Seatbelt による接続禁止（下記） |
+| PID namespace 道連れ（サービス宣言） | プロセスグループ + kqueue EVFILT_PROC（ベストエフォート） |
+| ~/.config/seki read-only bind mount | Seatbelt file ルールで write deny |
+
+移植不要（そのまま動く）: ルールエンジン、watch UI、コマンド承認レイヤー、hooks 連携、
+credential helper proxy、SSH agent proxy、環境変数フィルタ、SQLite ログ。
+3 層検問の頭脳部分はネットワーク機構に依存しない。
+
+### ネットワークデータパス（darwin）
+
+```
+User process (Seatbelt 内)
+  → HTTPS_PROXY=127.0.0.1:10200 に従い CONNECT example.com:443
+  → seki プロキシ: CONNECT のホスト名 + TLS ClientHello の SNI でルール評価
+  → allow: 実接続して bidirectional relay / deny: 407 + 接続切断
+  → PostToolUse hook でブロック理由をエージェントに注入（Linux 版と共通）
+
+User process が直接 connect を試みた場合
+  → Seatbelt が deny（errno EPERM）— 検問迂回は「通信不能」に落ちる
+```
+
+### DNS の扱い
+
+darwin では DNS 検問を独立レイヤーとして持たず、**プロキシ側解決に一本化**する:
+
+- CONNECT プロキシはホスト名で受けて自分で解決するため、クライアント側の DNS が不要
+- sandbox 内からの直接解決（mDNSResponder への mach-lookup / :53 直行）は Seatbelt で遮断
+  → DNS トンネリングも同時に塞がる
+- 副産物: クライアントが HTTPS/SVCB レコードを引けないため、**ECH 迂回問題が構造的に消える**
+  （Linux 版では ECH 除去が未実装 TODO として残っている）
+
+### ソケット信頼検証（darwin）
+
+Linux 版は SO_PEERCRED + user namespace 比較で sandbox 内からの approve をドロップする。
+darwin 版は 2 段構え:
+
+1. Seatbelt profile で watch/control ソケットのパスへの接続を deny — sandbox 内から
+   そもそも届かない（機構としてはこちらが本体）
+2. LOCAL_PEERCRED で euid を検証（多層防御）
+
+### SSH
+
+ssh はプロキシ環境変数を見ないため、`ProxyCommand` で seki 経由に固定する:
+
+```
+# seki が配置する .ssh/config（既存のコピーベース配置に追記）
+Host *
+    ProxyCommand seki proxy-connect %h %p
+```
+
+`seki proxy-connect` は stdio ↔ seki プロキシの relay。ルール評価はホスト名ベースで
+プロキシ側に乗る。SSH agent proxy（署名転送）は Linux 版と共通。
+
+### 失うもの・トレードオフ
+
+- **透過性**: プロキシ環境変数を無視するツールは「検問で観察される」ではなく
+  「通信できない」になる。learning mode の観察力が一段落ちる
+  （ブロックは Seatbelt の deny として起き、seki のログに乗らない可能性がある —
+  スパイクで確認）
+- **PID namespace のカーネル保証**: サービス宣言機能の道連れ停止がベストエフォートに落ちる。
+  darwin ではサービス宣言を当面スコープ外とし、必要になった時点で kqueue 監視を設計する
+- **プロファイル切り替えの bind-mount**: mount namespace がないため、credentials の
+  bind-mount 方式は使えない。環境変数（`CLAUDE_CONFIG_DIR` 等）ベースの方式に置き換える
+
+### ビルド・配布
+
+- `//go:build linux` / `//go:build darwin` でバックエンドを分離し、検問ロジックを共有する
+- `make release` に `seki-darwin-arm64` を追加。CGO 不要を維持
+  （Seatbelt は `/usr/bin/sandbox-exec` の exec で使い、libsandbox にリンクしない）
+- seki-mac ランチャーと docs/macos.md の VM 手順は deprecated
+
+### スパイク計画（実装前に検証する前提）
+
+リスク順。1 つでも落ちたら方式を再交渉する:
+
+1. **Seatbelt deny-all + localhost allow が強制できるか** — profile を書いて
+   `sandbox-exec` 経由で `curl https://example.com` が EPERM、
+   `HTTPS_PROXY` 経由が通ることを確認（macOS 26 実機）
+2. **mDNSResponder 経由の DNS 解決を遮断できるか** — `dig` / `getaddrinfo` 両経路
+3. **主要ツールのプロキシ追従** — claude / git (https) / npm / gh / curl が
+   `HTTPS_PROXY` + CONNECT で動くか
+4. **ssh ProxyCommand 経路** — git over ssh がルール評価に乗るか
+5. **LOCAL_PEERCRED** — Go から取得できるか（`golang.org/x/sys/unix.GetsockoptXucred`）
+6. **Seatbelt deny のログ可視性** — ブロックが seki 側で観察できるか
+   （できない場合、learning mode の darwin 版は「プロキシに来たものだけ観察」に縮退）
+
 ## 確定済み設計判断
 
 - ドメイン単位のネットワーク制御 (パス・メソッド・ボディは見ない)
@@ -857,6 +986,7 @@ services が宣言されていても「subuid not available — services will no
 - ホスト安全性: ホスト側の変更はゼロ (veth pair も不要に)
 - 承認は手続き単位 (ドメイン単位ではなく「git push」のような操作単位)
 - 2レイヤーモデル: ネットワーク (ホワイトリスト) + コマンド承認 (ブラックリスト)
+- Mac 対応は darwin ネイティブ (Seatbelt + 明示プロキシ) — Apple container VM アプローチは破棄
 - stderr 出力は抑制し、ログは SQLite + watch socket に集約
 - クレデンシャル隔離: 環境変数フィルタ + credential helper proxy (代理実行ではなく credential だけ注入)
 - 承認された操作だけに credential が渡る (承認キューとの統合)
