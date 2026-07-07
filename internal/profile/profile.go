@@ -126,7 +126,8 @@ func expandHome(pattern string) string {
 // ProjectMapping.Match).
 //
 // When the returned slice is empty the caller should treat this the same as
-// no services being declared at all (no supervisor mode, no CLONE_NEWPID).
+// no services being declared at all (the supervisor still runs as pid 1,
+// just with no services to spawn).
 func MatchServices(cwd string, services []Service) []Service {
 	var matched []Service
 	for _, svc := range services {

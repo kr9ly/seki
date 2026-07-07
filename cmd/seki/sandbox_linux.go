@@ -69,11 +69,11 @@ func cmdNsSetup() {
 // then sets up the namespace (tmpfs mounts, newuidmap wrapper, Podman config)
 // and execs the user command. Ambient caps survive all execs in the chain.
 //
-// When services are declared in the global config, cmdNsExec acts as a
-// supervisor instead of exec-ing the user command directly: it spawns the
-// declared services, waits for readiness, runs the user command as a child
-// process, then shuts the services down on exit. This keeps the no-services
-// path entirely unchanged.
+// cmdNsExec always runs as pid 1 of a fresh pid namespace and acts as a
+// supervisor: it spawns any declared services, waits for readiness, runs the
+// user command as a child process (reaping orphans as pid 1), then shuts the
+// services down on exit. The pid namespace hides host processes from the
+// sandbox and guarantees kill-on-exit for everything spawned inside.
 func cmdNsExec() {
 	args := argsAfterSep(os.Args[2:])
 	if len(args) == 0 {
@@ -133,31 +133,19 @@ func cmdNsExec() {
 		activeServices = profile.MatchServices(cwd, gc.Services)
 	}
 
-	if len(activeServices) == 0 {
-		// No applicable services (or config error) — keep the original exec path unchanged.
-		path, err := exec.LookPath(args[0])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "seki __ns-exec: %v\n", err)
-			os.Exit(127)
-		}
-		if err := syscall.Exec(path, args, os.Environ()); err != nil {
-			fmt.Fprintf(os.Stderr, "seki __ns-exec: exec %v: %v\n", args[0], err)
-			os.Exit(1)
-		}
-		return // unreachable but keeps the compiler happy
-	}
-
-	// When CLONE_NEWPID was used (set by cmdChild when services are declared),
-	// this process is pid 1 in the new pid namespace. Remount /proc so that
-	// ps, procfs tools, and Podman see this namespace's pids rather than the
-	// outer one.
+	// cmdChild always creates a pid namespace, so this process is pid 1.
+	// Remount /proc so that ps, procfs tools, and Podman see this namespace's
+	// pids rather than the outer one. This is also what hides host processes
+	// from sandboxed code.
 	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
 		// Non-fatal: only happens when CLONE_NEWPID was not set (e.g. during
 		// unit tests or if the parent omitted it), so we warn and continue.
 		fmt.Fprintf(os.Stderr, "seki __ns-exec: remount /proc: %v\n", err)
 	}
 
-	// Supervisor mode: spawn services, run user command, then shut down.
+	// Supervisor mode (even with no services): as pid 1 we must reap orphans
+	// and guarantee kill-on-exit, so the user command always runs as a child
+	// rather than being exec'd in place.
 	os.Exit(runSupervisor(args, activeServices))
 }
 
@@ -421,7 +409,6 @@ func cmdChild() {
 		// and the zombie-reaping loop). The no-subuid path does not go through
 		// __ns-exec, so it cannot host services.
 		fmt.Fprintf(os.Stderr, "seki: subuid not available — services will not be started\n")
-		hasServices = false
 	}
 
 	if useSubIDs {
@@ -446,17 +433,16 @@ func cmdChild() {
 		cmd.Env = append(os.Environ(), "SEKI_ACTIVE=1")
 		cmd.ExtraFiles = []*os.File{mapReadyPr} // fd 3 = mapReady
 
-		cloneFlags := uintptr(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS)
-		if hasServices {
-			// Add CLONE_NEWPID so the supervisor (__ns-exec) becomes pid 1.
-			// When the supervisor exits, the kernel sends SIGKILL to all remaining
-			// processes in the namespace — double-fork daemons cannot escape.
-			cloneFlags |= syscall.CLONE_NEWPID
-		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			// CLONE_NEWNS: needed for tmpfs mounts and bind-mounting newuidmap wrapper
-			// CLONE_NEWPID (conditional): supervisor mode — orphan reaping + kill-on-exit
-			Cloneflags: cloneFlags,
+			// CLONE_NEWPID: the supervisor (__ns-exec) becomes pid 1. Isolates the
+			// sandbox from the host pid namespace — sandboxed code cannot see or
+			// signal host processes (kill(2) permission is uid-based and subuid
+			// mapping preserves the owner uid, so without pid isolation a sandboxed
+			// process could SIGKILL any same-user host process). Also guarantees
+			// kill-on-exit: when pid 1 exits, the kernel SIGKILLs every remaining
+			// process in the namespace — double-fork daemons cannot escape.
+			Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | syscall.CLONE_NEWPID,
 			// Ambient caps survive exec: the user command (and Podman, and our
 			// newuidmap wrapper) all inherit these capabilities.
 			AmbientCaps: []uintptr{
@@ -508,7 +494,10 @@ func cmdChild() {
 			os.Exit(1)
 		}
 	} else {
-		// No subuid: single-entry mapping via Go's built-in write.
+		// No subuid: single-entry mapping via Go's built-in write. This path
+		// cannot use CLONE_NEWPID (the user command would become pid 1 with
+		// reaping duties), so host processes remain visible and signalable.
+		fmt.Fprintf(os.Stderr, "seki: subuid not available — pid namespace isolation disabled\n")
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
