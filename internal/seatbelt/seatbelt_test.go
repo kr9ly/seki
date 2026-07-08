@@ -17,7 +17,7 @@ func TestProfileStructure(t *testing.T) {
 	// Ordering: SBPL gives precedence to later rules, so the deny-all must
 	// come before the loopback carve-outs, and the specific denies after.
 	denyAll := strings.Index(p, "(deny network*)")
-	allowLoopback := strings.Index(p, `(allow network* (remote ip "localhost:*"))`)
+	allowLoopback := strings.Index(p, `(allow network-outbound (remote ip "localhost:*"))`)
 	denyDNS := strings.Index(p, "mDNSResponder")
 	denyCtl := strings.Index(p, "seki-123.sock")
 
@@ -26,6 +26,20 @@ func TestProfileStructure(t *testing.T) {
 	}
 	if !(denyAll < allowLoopback && allowLoopback < denyDNS && allowLoopback < denyCtl) {
 		t.Fatalf("rule ordering violates SBPL later-wins precedence:\n%s", p)
+	}
+
+	// An outbound connect on an unbound socket has a wildcard local address
+	// that Seatbelt matches against (local ip "localhost:*"), so a blanket
+	// network* allow filtered by the local address reopens all outbound
+	// traffic. Outbound may only be carved out by remote address.
+	for _, banned := range []string{
+		`(allow network* (local ip`,
+		`(allow network* (remote ip`,
+		`(allow network-outbound (local ip`,
+	} {
+		if strings.Contains(p, banned) {
+			t.Errorf("profile contains forbidden rule shape %q (reopens outbound)", banned)
+		}
 	}
 
 	for _, want := range []string{

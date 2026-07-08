@@ -59,8 +59,16 @@ func Profile(p Params) string {
 ;; and the seki CONNECT proxy. Non-loopback stays denied — cooperative
 ;; processes follow HTTP(S)_PROXY through the checkpoint, everything else
 ;; gets EPERM.
-(allow network* (local ip "localhost:*"))
-(allow network* (remote ip "localhost:*"))
+;;
+;; Carve-outs are per-operation on purpose. An outbound connect/sendto on an
+;; unbound socket has a wildcard local address, which Seatbelt matches
+;; against (local ip "localhost:*") — so a blanket network* allow filtered
+;; by the local address reopens ALL outbound traffic (confirmed on a real
+;; Mac: direct TCP/UDP to 8.8.8.8 passed). Outbound must therefore be
+;; filtered by the REMOTE address only.
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))
 
 ;; Unix sockets: ssh-agent proxy, credential helper, build tooling.
 (allow network* (local unix-socket))
