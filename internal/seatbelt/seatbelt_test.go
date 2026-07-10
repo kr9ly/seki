@@ -28,17 +28,28 @@ func TestProfileStructure(t *testing.T) {
 		t.Fatalf("rule ordering violates SBPL later-wins precedence:\n%s", p)
 	}
 
-	// An outbound connect on an unbound socket has a wildcard local address
-	// that Seatbelt matches against (local ip "localhost:*"), so a blanket
-	// network* allow filtered by the local address reopens all outbound
-	// traffic. Outbound may only be carved out by remote address.
+	// Wildcard addresses match (local ip "localhost:*") in Seatbelt, so any
+	// carve-out filtered by an address that can be wildcard reopens traffic:
+	// outbound sockets have a wildcard local until connect, and
+	// wildcard-bound listeners have a wildcard local at accept. Data-moving
+	// operations may only be carved out by the remote address.
 	for _, banned := range []string{
 		`(allow network* (local ip`,
 		`(allow network* (remote ip`,
 		`(allow network-outbound (local ip`,
+		`(allow network-inbound (local ip`,
 	} {
 		if strings.Contains(p, banned) {
-			t.Errorf("profile contains forbidden rule shape %q (reopens outbound)", banned)
+			t.Errorf("profile contains forbidden rule shape %q (reopens traffic)", banned)
+		}
+	}
+
+	for _, want := range []string{
+		"(allow network-bind)",
+		`(allow network-inbound (remote ip "localhost:*"))`,
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("profile missing %q", want)
 		}
 	}
 

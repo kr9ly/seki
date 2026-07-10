@@ -60,14 +60,21 @@ func Profile(p Params) string {
 ;; processes follow HTTP(S)_PROXY through the checkpoint, everything else
 ;; gets EPERM.
 ;;
-;; Carve-outs are per-operation on purpose. An outbound connect/sendto on an
-;; unbound socket has a wildcard local address, which Seatbelt matches
-;; against (local ip "localhost:*") — so a blanket network* allow filtered
-;; by the local address reopens ALL outbound traffic (confirmed on a real
-;; Mac: direct TCP/UDP to 8.8.8.8 passed). Outbound must therefore be
-;; filtered by the REMOTE address only.
-(allow network-bind (local ip "localhost:*"))
-(allow network-inbound (local ip "localhost:*"))
+;; Carve-outs are per-operation on purpose, and each operation is filtered
+;; by whichever address is guaranteed concrete. A wildcard address matches
+;; (local ip "localhost:*") in Seatbelt (confirmed on a real Mac: an unbound
+;; outbound socket's wildcard local reopened ALL outbound traffic in
+;; v0.2.0), so:
+;; - outbound: filter by REMOTE only (local is wildcard until connect).
+;; - bind: allow unconditionally — bind moves no data, and restricting it
+;;   to loopback breaks JVM tooling (Gradle daemons bind 0.0.0.0:0). The
+;;   actual traffic is gated below.
+;; - inbound: filter by REMOTE — a wildcard-bound listener has a wildcard
+;;   local, so a local filter would let LAN peers through the loopback
+;;   carve-out. The peer address of an incoming connection is always
+;;   concrete; only loopback peers may deliver.
+(allow network-bind)
+(allow network-inbound (remote ip "localhost:*"))
 (allow network-outbound (remote ip "localhost:*"))
 
 ;; Unix sockets: ssh-agent proxy, credential helper, build tooling.
