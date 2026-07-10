@@ -28,25 +28,26 @@ func TestProfileStructure(t *testing.T) {
 		t.Fatalf("rule ordering violates SBPL later-wins precedence:\n%s", p)
 	}
 
-	// Wildcard addresses match (local ip "localhost:*") in Seatbelt, so any
-	// carve-out filtered by an address that can be wildcard reopens traffic:
-	// outbound sockets have a wildcard local until connect, and
-	// wildcard-bound listeners have a wildcard local at accept. Data-moving
-	// operations may only be carved out by the remote address.
+	// Each operation must be filtered by the address present at check time
+	// (both confirmed on a real Mac):
+	// - outbound: a local filter reopens all outbound traffic — an unbound
+	//   socket's wildcard local matches "localhost:*" (v0.2.0). Remote only.
+	// - inbound: a remote filter breaks listen(2), which is checked as
+	//   network-inbound with no peer (v0.2.2 broke Gradle). Local only.
 	for _, banned := range []string{
 		`(allow network* (local ip`,
 		`(allow network* (remote ip`,
 		`(allow network-outbound (local ip`,
-		`(allow network-inbound (local ip`,
+		`(allow network-inbound (remote ip`,
 	} {
 		if strings.Contains(p, banned) {
-			t.Errorf("profile contains forbidden rule shape %q (reopens traffic)", banned)
+			t.Errorf("profile contains forbidden rule shape %q", banned)
 		}
 	}
 
 	for _, want := range []string{
 		"(allow network-bind)",
-		`(allow network-inbound (remote ip "localhost:*"))`,
+		`(allow network-inbound (local ip "localhost:*"))`,
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("profile missing %q", want)
