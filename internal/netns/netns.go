@@ -297,29 +297,23 @@ func Exec(args []string) (*Sandbox, error) {
 	// Handle messages from clients.
 	// "forward" events are handled by the parent (slirp API proxy).
 	// All other events are re-broadcast to all clients (including child).
+	fwdTable := &forwardTable{fwds: make(map[int]fwdEntry)}
 	sock.OnMessage(func(e socket.Event) {
 		if e.Type == "forward" && e.Port > 0 && e.Port <= 65535 {
-			// Find an available host port
-			ln, err := net.Listen("tcp", ":0")
+			f, created, err := fwdTable.resolve(apiSockPath, e.Port)
 			if err != nil {
 				sock.Emit(socket.Event{Type: "forward_error", Port: e.Port, Error: err.Error()})
 				return
 			}
-			hostPort := ln.Addr().(*net.TCPAddr).Port
-			ln.Close()
-
-			id, err := slirpAddHostFwd(apiSockPath, hostPort, e.Port)
-			if err != nil {
-				sock.Emit(socket.Event{Type: "forward_error", Port: e.Port, Error: err.Error()})
-				return
+			if created {
+				// Tell child to add iptables DNAT for the forwarded port
+				sock.Emit(socket.Event{Type: "dnat", Port: e.Port})
 			}
-			// Tell child to add iptables DNAT for the forwarded port
-			sock.Emit(socket.Event{Type: "dnat", Port: e.Port})
 			sock.Emit(socket.Event{
 				Type:      "forward_done",
 				Port:      e.Port,
-				HostPort:  hostPort,
-				ForwardID: id,
+				HostPort:  f.hostPort,
+				ForwardID: f.id,
 			})
 			return
 		}
@@ -979,6 +973,46 @@ func run(name string, args ...string) error {
 		return fmt.Errorf("%s %s: %s: %w", name, strings.Join(args, " "), strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+type fwdEntry struct {
+	hostPort int
+	id       int
+}
+
+// forwardTable tracks host→guest port forwards for the sandbox lifetime.
+// Forwards are never removed, so repeated requests for the same guest
+// port return the existing mapping instead of allocating a new host port.
+type forwardTable struct {
+	mu   gosync.Mutex
+	fwds map[int]fwdEntry
+}
+
+// resolve returns the forward entry for guestPort, allocating a host port
+// and registering a slirp hostfwd on first request. created reports whether
+// a new mapping was made (the caller must set up DNAT for new mappings).
+func (t *forwardTable) resolve(apiSock string, guestPort int) (f fwdEntry, created bool, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if f, ok := t.fwds[guestPort]; ok {
+		return f, false, nil
+	}
+
+	// Find an available host port
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		return fwdEntry{}, false, err
+	}
+	hostPort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	id, err := slirpAddHostFwd(apiSock, hostPort, guestPort)
+	if err != nil {
+		return fwdEntry{}, false, err
+	}
+	f = fwdEntry{hostPort: hostPort, id: id}
+	t.fwds[guestPort] = f
+	return f, true, nil
 }
 
 // slirpAddHostFwd adds a TCP host-to-guest port forward via the slirp4netns API.
