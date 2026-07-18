@@ -60,30 +60,25 @@ func Profile(p Params) string {
 ;; processes follow HTTP(S)_PROXY through the checkpoint, everything else
 ;; gets EPERM.
 ;;
-;; Carve-outs are per-operation on purpose, and each operation is filtered
-;; by the address that is present at check time. Two facts confirmed on a
-;; real Mac constrain the shape:
-;; - A wildcard LOCAL address matches (local ip "localhost:*") — an unbound
-;;   outbound socket's wildcard local reopened ALL outbound traffic in
-;;   v0.2.0. Outbound must therefore be filtered by REMOTE only.
-;; - listen(2) is checked as network-inbound with no peer, so a
-;;   remote-filtered inbound allow never matches it and listen fails with
-;;   EPERM (v0.2.2 broke Gradle: the JVM binds 0.0.0.0:0 then listens).
-;;   Inbound must therefore be filtered by LOCAL.
-;; So:
-;; - bind: allow unconditionally — bind moves no data; restricting it to
-;;   loopback breaks JVM tooling. The actual traffic is gated below.
-;; - inbound: filter by LOCAL. listen on a wildcard-bound socket passes via
-;;   the wildcard-matches-localhost behavior above; loopback deliveries have
-;;   a loopback local. Whether a LAN peer can reach a wildcard-bound
-;;   listener depends on which local address delivery-time checks see (the
-;;   connection's concrete interface address, or the listener's wildcard) —
-;;   unverified, and acceptable either way: seki guards the network EXIT;
-;;   host/LAN reachability of in-sandbox servers is outside the threat
-;;   model (sandboxed code cannot signal out to invite a connection).
-;; - outbound: filter by REMOTE only (local is wildcard until connect).
+;; Carve-outs are per-operation on purpose. seki guards the network EXIT:
+;; only outbound is filtered; bind and inbound are open. Rationale, from
+;; three real-Mac incidents:
+;; - outbound: filter by REMOTE only. A local filter reopens ALL outbound
+;;   traffic — an unbound socket's wildcard local matches
+;;   (local ip "localhost:*") (v0.2.0).
+;; - bind: unconditional — bind moves no data; a loopback-only bind rule
+;;   broke JVM tooling, which binds wildcard (v0.2.1).
+;; - inbound: unconditional — listen(2) is checked as network-inbound, so
+;;   any filter must match it too. A remote filter never matches listen
+;;   (no peer yet, v0.2.2), and a local loopback filter fails IPv6
+;;   dual-stack listeners (the v4 wildcard matches "localhost:*" but the
+;;   v6 wildcard :: does not, v0.2.3). Host/LAN reachability of in-sandbox
+;;   servers is outside the threat model: an inbound connection is only
+;;   two-way once an OUTSIDE party initiates it — sandboxed code cannot
+;;   signal out to invite one, and UDP replies are network-outbound and
+;;   stay denied.
 (allow network-bind)
-(allow network-inbound (local ip "localhost:*"))
+(allow network-inbound)
 (allow network-outbound (remote ip "localhost:*"))
 
 ;; Unix sockets: ssh-agent proxy, credential helper, build tooling.
