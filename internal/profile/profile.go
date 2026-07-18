@@ -44,6 +44,14 @@ type Service struct {
 	StopCommand []string `json:"stop_command,omitempty"`
 	// Env holds additional environment variables merged on top of os.Environ().
 	Env map[string]string `json:"env,omitempty"`
+	// PrivateDirs lists directories to overlay with a sandbox-private tmpfs
+	// before this service starts. Environment variables are expanded via
+	// os.ExpandEnv. The mount lives in the sandbox's mount namespace only, so
+	// concurrent sandboxes each see their own empty directory at the same path
+	// while the host directory stays untouched. Use this for daemons whose
+	// default runtime paths would collide across sandboxes (e.g. rootless
+	// podman's $XDG_RUNTIME_DIR/podman and pause.pid).
+	PrivateDirs []string `json:"private_dirs,omitempty"`
 }
 
 type GlobalConfig struct {

@@ -133,6 +133,13 @@ func cmdNsExec() {
 		activeServices = profile.MatchServices(cwd, gc.Services)
 	}
 
+	// Overlay service-declared private dirs with a sandbox-private tmpfs.
+	// The mount tree was promoted to a fresh peer group above, so these
+	// mounts propagate into nested namespaces (Podman) but never to the
+	// host or to sibling sandboxes. This lets daemons keep their default
+	// paths (sockets, pid files, storage) without cross-sandbox collisions.
+	mountPrivateDirs(activeServices)
+
 	// cmdChild always creates a pid namespace, so this process is pid 1.
 	// Remount /proc so that ps, procfs tools, and Podman see this namespace's
 	// pids rather than the outer one. This is also what hides host processes
@@ -807,6 +814,32 @@ func slirpAPICall(apiSock string, req map[string]interface{}) (map[string]interf
 // entries. It opens file descriptors to the original children before
 // mounting tmpfs (which shadows them), then bind-mounts each one back
 // via /proc/self/fd/<n>.
+// mountPrivateDirs overlays each service-declared private dir with a fresh
+// tmpfs owned by the sandbox user. Paths are expanded via os.ExpandEnv.
+// Failures are reported but non-fatal: a missing overlay degrades to the
+// shared host path, which is the pre-feature behavior.
+func mountPrivateDirs(services []profile.Service) {
+	opts := fmt.Sprintf("mode=0700,uid=%d,gid=%d", os.Getuid(), os.Getgid())
+	mounted := make(map[string]bool)
+	for _, svc := range services {
+		for _, dir := range svc.PrivateDirs {
+			expanded := filepath.Clean(os.ExpandEnv(dir))
+			if expanded == "/" || mounted[expanded] {
+				continue
+			}
+			if err := os.MkdirAll(expanded, 0700); err != nil {
+				fmt.Fprintf(os.Stderr, "seki __ns-exec: private dir %s: %v\n", expanded, err)
+				continue
+			}
+			if err := syscall.Mount("tmpfs", expanded, "tmpfs", 0, opts); err != nil {
+				fmt.Fprintf(os.Stderr, "seki __ns-exec: mount private tmpfs %s: %v\n", expanded, err)
+				continue
+			}
+			mounted[expanded] = true
+		}
+	}
+}
+
 func mountTmpfsPreserving(dir string) {
 	entries, _ := os.ReadDir(dir)
 
