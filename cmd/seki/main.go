@@ -218,6 +218,22 @@ func cmdWatch() {
 	var queue []queueItem
 	var queueMu sync.Mutex
 
+	// itemLabel builds the human-readable label for a queue item, shared by
+	// the queue display and herdr state reports.
+	itemLabel := func(item queueItem) string {
+		if item.command != "" {
+			return "cmd: " + item.command
+		}
+		label := item.domain
+		if item.dest != "" && item.dest != item.domain {
+			label = item.dest + " (" + item.domain + ")"
+		}
+		return label
+	}
+
+	herdr := newHerdrReporter()
+	herdr.report("idle", "")
+
 	events := make(chan taggedEvent, 100)
 	connected := make(map[string]*socket.Client) // path -> client
 	var connMu sync.Mutex
@@ -307,6 +323,16 @@ func cmdWatch() {
 	// renderQueueArea redraws the fixed bottom area.
 	// Must be called with queueMu held.
 	renderQueueArea := func() {
+		if len(queue) == 0 {
+			herdr.report("idle", "")
+		} else {
+			msg := itemLabel(queue[0])
+			if len(queue) > 1 {
+				msg = fmt.Sprintf("%s (+%d more)", msg, len(queue)-1)
+			}
+			herdr.report("blocked", msg)
+		}
+
 		newTui := buildTUI(tui.rows, tui.cols, len(queue))
 		if newTui.logBottom != tui.logBottom {
 			// Layout changed: update scroll region
@@ -341,15 +367,7 @@ func cmdWatch() {
 				if i == 0 {
 					prefix = inverse + "❯ " + reset
 				}
-				var label string
-				if item.command != "" {
-					label = "cmd: " + item.command
-				} else {
-					label = item.domain
-					if item.dest != "" && item.dest != item.domain {
-						label = item.dest + " (" + item.domain + ")"
-					}
-				}
+				label := itemLabel(item)
 				if i == 0 {
 					fmt.Printf("\033[%d;1H%s%s — %s[a]%sllow %s[p]%sass %s[d]%seny (^A/^P/^D)%s",
 						row, prefix, label, bold, reset, bold, reset, bold, reset, reset)
