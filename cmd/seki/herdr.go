@@ -22,7 +22,7 @@ type herdrReporter struct {
 	sockPath string
 
 	mu        sync.Mutex
-	seq       int
+	seq       int64
 	lastState string
 	lastMsg   string
 }
@@ -49,8 +49,12 @@ func (h *herdrReporter) report(state, message string) {
 		return
 	}
 	h.lastState, h.lastMsg = state, message
-	h.seq++
-	seq := h.seq
+	// herdr tracks seq per source and ignores reports at or below the last
+	// accepted value — surviving watch restarts requires a clock, not a
+	// process-local counter. Microseconds stay within float64-exact range
+	// for JSON; the max() guards same-microsecond consecutive reports.
+	seq := max(time.Now().UnixMicro(), h.seq+1)
+	h.seq = seq
 	h.mu.Unlock()
 
 	req := map[string]any{

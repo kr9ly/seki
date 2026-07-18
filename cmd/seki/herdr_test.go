@@ -86,8 +86,8 @@ func TestHerdrReporter(t *testing.T) {
 	if params2["state"] != "idle" {
 		t.Errorf("state = %v, want idle (duplicate should be suppressed)", params2["state"])
 	}
-	if s1, s2 := params["seq"].(float64), params2["seq"].(float64); s2 != s1+1 {
-		t.Errorf("seq advanced %v → %v, want +1 (duplicate must not consume seq)", s1, s2)
+	if s1, s2 := params["seq"].(float64), params2["seq"].(float64); s2 <= s1 {
+		t.Errorf("seq %v → %v, want strictly increasing", s1, s2)
 	}
 
 	select {
