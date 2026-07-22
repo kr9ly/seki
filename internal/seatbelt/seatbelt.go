@@ -80,6 +80,13 @@ func Profile(p Params) string {
 (allow network-bind)
 (allow network-inbound)
 (allow network-outbound (remote ip "localhost:*"))
+;; IPv6 loopback needs its own carve-out: "localhost:*" under plain ip
+;; matches the v4 loopback and the v4 wildcard, but neither ::1 nor the v6
+;; wildcard :: — clients that connect to :: (kernel routes it to loopback)
+;; get EPERM (adb-style tools hitting *:5037, v0.2.5).
+;; SPIKE: confirm on a real Mac that ip6 "localhost:*" matches both ::1 and
+;; the v6 wildcard ::.
+(allow network-outbound (remote ip6 "localhost:*"))
 
 ;; Unix sockets: ssh-agent proxy, credential helper, build tooling.
 (allow network* (local unix-socket))
@@ -98,8 +105,10 @@ func Profile(p Params) string {
 (deny mach-lookup (global-name "com.apple.mDNSResponder"))
 (deny mach-lookup (global-name "com.apple.dnssd.service"))
 ;; A local resolver/forwarder on loopback would reopen the tunnel through
-;; the loopback carve-out above; deny port 53 explicitly.
+;; the loopback carve-outs above; deny port 53 explicitly — on both address
+;; families, since each has its own carve-out.
 (deny network* (remote ip "localhost:53"))
+(deny network* (remote ip6 "localhost:53"))
 `)
 
 	if len(p.DenySockets) > 0 {

@@ -18,14 +18,18 @@ func TestProfileStructure(t *testing.T) {
 	// come before the loopback carve-outs, and the specific denies after.
 	denyAll := strings.Index(p, "(deny network*)")
 	allowLoopback := strings.Index(p, `(allow network-outbound (remote ip "localhost:*"))`)
+	allowLoopback6 := strings.Index(p, `(allow network-outbound (remote ip6 "localhost:*"))`)
 	denyDNS := strings.Index(p, "mDNSResponder")
 	denyCtl := strings.Index(p, "seki-123.sock")
 
-	if denyAll == -1 || allowLoopback == -1 || denyDNS == -1 || denyCtl == -1 {
+	if denyAll == -1 || allowLoopback == -1 || allowLoopback6 == -1 || denyDNS == -1 || denyCtl == -1 {
 		t.Fatalf("missing expected rules in profile:\n%s", p)
 	}
 	if !(denyAll < allowLoopback && allowLoopback < denyDNS && allowLoopback < denyCtl) {
 		t.Fatalf("rule ordering violates SBPL later-wins precedence:\n%s", p)
+	}
+	if !(denyAll < allowLoopback6 && allowLoopback6 < denyDNS) {
+		t.Fatalf("ip6 carve-out ordering violates SBPL later-wins precedence:\n%s", p)
 	}
 
 	// Only outbound is filtered, and by REMOTE only (all confirmed on a
@@ -63,6 +67,7 @@ func TestProfileStructure(t *testing.T) {
 		`(deny file-write* (subpath "/Users/alice/.config/seki"))`,
 		`(deny network* (remote unix-socket (path-literal "/Users/alice/.config/seki/seki-123.sock")))`,
 		`(deny network* (remote ip "localhost:53"))`,
+		`(deny network* (remote ip6 "localhost:53"))`,
 		`(deny mach-lookup (global-name "com.apple.mDNSResponder"))`,
 	} {
 		if !strings.Contains(p, want) {
