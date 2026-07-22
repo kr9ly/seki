@@ -225,3 +225,43 @@ func TestMatchServicesMatchParse(t *testing.T) {
 		t.Errorf("miss cwd: want [global], got %v", miss)
 	}
 }
+
+func TestGlobalConfigBridgesParse(t *testing.T) {
+	raw := `{"bridges":[
+		{"name":"adb","match":"/home/user/projects/app-*","listen":"[::1]:5037","connect":"127.0.0.1:5037"},
+		{"name":"global","listen":"[::1]:9999","connect":"127.0.0.1:9999"}
+	]}`
+	var gc GlobalConfig
+	if err := json.Unmarshal([]byte(raw), &gc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(gc.Bridges) != 2 {
+		t.Fatalf("want 2 bridges, got %d", len(gc.Bridges))
+	}
+	br := gc.Bridges[0]
+	if br.Name != "adb" || br.Listen != "[::1]:5037" || br.Connect != "127.0.0.1:5037" {
+		t.Errorf("bridge[0] = %+v, want adb [::1]:5037 → 127.0.0.1:5037", br)
+	}
+	if br.Match != "/home/user/projects/app-*" {
+		t.Errorf("Match = %q, want /home/user/projects/app-*", br.Match)
+	}
+	if gc.Bridges[1].Match != "" {
+		t.Errorf("Match for global bridge = %q, want empty", gc.Bridges[1].Match)
+	}
+}
+
+func TestMatchBridgesMixed(t *testing.T) {
+	bridges := []Bridge{
+		{Name: "global", Listen: "[::1]:1", Connect: "127.0.0.1:1"},
+		{Name: "work", Match: "/home/user/projects/work-*", Listen: "[::1]:2", Connect: "127.0.0.1:2"},
+		{Name: "other", Match: "/home/user/projects/other-*", Listen: "[::1]:3", Connect: "127.0.0.1:3"},
+	}
+	got := MatchBridges("/home/user/projects/work-repo", bridges)
+	if len(got) != 2 {
+		t.Fatalf("MatchBridges mixed = %d bridges, want 2", len(got))
+	}
+	if got[0].Name != "global" || got[1].Name != "work" {
+		t.Errorf("MatchBridges mixed names = [%s, %s], want [global, work]",
+			got[0].Name, got[1].Name)
+	}
+}

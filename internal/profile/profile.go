@@ -54,10 +54,32 @@ type Service struct {
 	PrivateDirs []string `json:"private_dirs,omitempty"`
 }
 
+// Bridge declares a host-side TCP forwarder that runs for the lifetime of
+// the sandbox (darwin backend only). The darwin sandbox shares the host
+// network stack, so a bridge listening on one loopback family can hand
+// connections to a server on the other — e.g. adb clients that probe
+// [::1]:5037 while the adb server listens on 127.0.0.1 only.
+type Bridge struct {
+	// Name is used in diagnostic messages.
+	Name string `json:"name"`
+	// Match is an optional glob pattern matched against the sandbox's cwd,
+	// with the same semantics as Service.Match. When omitted, the bridge
+	// applies to all sessions.
+	Match string `json:"match,omitempty"`
+	// Listen is the address to listen on, e.g. "[::1]:5037". If the address
+	// is already bound (another sandbox's bridge, or a real listener), the
+	// bridge is skipped with a notice rather than treated as an error.
+	Listen string `json:"listen"`
+	// Connect is the address each accepted connection is forwarded to,
+	// e.g. "127.0.0.1:5037".
+	Connect string `json:"connect"`
+}
+
 type GlobalConfig struct {
 	ClaudeProfiles *Config           `json:"claude_profiles"`
 	SandboxEnv     map[string]string `json:"sandbox_env"`
 	Services       []Service         `json:"services,omitempty"`
+	Bridges        []Bridge          `json:"bridges,omitempty"`
 }
 
 // LoadGlobalConfig reads ~/.config/seki/config.json.
@@ -151,6 +173,28 @@ func MatchServices(cwd string, services []Service) []Service {
 		}
 		if ok {
 			matched = append(matched, svc)
+		}
+	}
+	return matched
+}
+
+// MatchBridges filters bridges to those that apply for the given working
+// directory, with the same matching semantics as MatchServices.
+func MatchBridges(cwd string, bridges []Bridge) []Bridge {
+	var matched []Bridge
+	for _, br := range bridges {
+		if br.Match == "" {
+			matched = append(matched, br)
+			continue
+		}
+		pattern := expandHome(br.Match)
+		ok, err := filepath.Match(pattern, cwd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki: bad bridge match pattern %q: %v\n", br.Match, err)
+			continue
+		}
+		if ok {
+			matched = append(matched, br)
 		}
 	}
 	return matched

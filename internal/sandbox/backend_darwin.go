@@ -17,6 +17,7 @@
 package sandbox
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -24,9 +25,11 @@ import (
 	"path/filepath"
 	"strings"
 	gosync "sync"
+	"syscall"
 	"time"
 
 	"github.com/kr9ly/seki/internal/approval"
+	"github.com/kr9ly/seki/internal/bridge"
 	"github.com/kr9ly/seki/internal/credential"
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/profile"
@@ -118,6 +121,26 @@ func darwinExec(args []string) (*darwinSandbox, error) {
 	}
 	if len(globalCfg.Services) > 0 {
 		fmt.Fprintln(os.Stderr, "seki: services are not supported by the darwin backend yet — ignoring")
+	}
+
+	// Loopback bridges: host-side forwarders tied to this sandbox's lifetime.
+	// The address is shared with the host and sibling sandboxes (no netns on
+	// darwin), so an already-bound listen address means someone is serving it
+	// — skip, don't fail. Consequence: the sandbox that started a bridge takes
+	// it down on exit even if a sibling still uses it; the next sandbox
+	// re-creates it.
+	for _, br := range profile.MatchBridges(cwd, globalCfg.Bridges) {
+		b, err := bridge.Start(br.Name, br.Listen, br.Connect)
+		if err != nil {
+			if errors.Is(err, syscall.EADDRINUSE) {
+				fmt.Fprintf(os.Stderr, "seki: bridge %s: %s already has a listener — skipping\n", br.Name, br.Listen)
+			} else {
+				fmt.Fprintf(os.Stderr, "seki: bridge %s: %v\n", br.Name, err)
+			}
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "seki: bridge %s: %s → %s\n", br.Name, br.Listen, br.Connect)
+		sb.cleanup = append(sb.cleanup, func() { b.Close() })
 	}
 
 	log, err := logger.Open()
