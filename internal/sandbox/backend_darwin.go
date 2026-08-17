@@ -320,12 +320,17 @@ func darwinExec(args []string) (*darwinSandbox, error) {
 
 // resolveClaudeProfile maps the working directory to a Claude profile and
 // returns extra env vars pointing Claude Code at the per-profile config dir.
+// The SEKI_CLAUDE_PROFILE override (set by `seki exec --claude-profile`)
+// wins over cwd-based resolution.
 func resolveClaudeProfile(cwd, home string) (string, []string) {
-	cfg, err := profile.LoadConfig()
-	if err != nil || cfg == nil || cwd == "" {
-		return "", nil
+	name := os.Getenv("SEKI_CLAUDE_PROFILE")
+	if name == "" {
+		cfg, err := profile.LoadConfig()
+		if err != nil || cfg == nil || cwd == "" {
+			return "", nil
+		}
+		name = cfg.Resolve(cwd)
 	}
-	name := cfg.Resolve(cwd)
 	if name == "" {
 		return "", nil
 	}

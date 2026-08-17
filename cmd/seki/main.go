@@ -1111,9 +1111,33 @@ func argsAfterSep(args []string) []string {
 }
 
 func cmdExec() {
-	args := argsAfterSep(os.Args[2:])
+	// Parse flags before "--". The command after "--" is passed through as-is.
+	rest := os.Args[2:]
+	for len(rest) > 0 {
+		a := rest[0]
+		if a == "--" {
+			rest = rest[1:]
+			break
+		}
+		if a == "--claude-profile" && len(rest) >= 2 {
+			os.Setenv("SEKI_CLAUDE_PROFILE", rest[1])
+			rest = rest[2:]
+			continue
+		}
+		if strings.HasPrefix(a, "--claude-profile=") {
+			os.Setenv("SEKI_CLAUDE_PROFILE", strings.TrimPrefix(a, "--claude-profile="))
+			rest = rest[1:]
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			rest = rest[1:]
+			continue
+		}
+		break
+	}
+	args := rest
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: seki exec [--learning] -- <command> [args...]")
+		fmt.Fprintln(os.Stderr, "usage: seki exec [--claude-profile <name>] -- <command> [args...]")
 		os.Exit(1)
 	}
 

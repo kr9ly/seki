@@ -873,24 +873,33 @@ func bindSSH() error {
 	return nil
 }
 
-// bindClaudeProfile bind-mounts a profile-specific .credentials.json over
-// ~/.claude/.credentials.json based on the project's working directory.
-// Returns the resolved profile name (empty if no profile applies).
-func bindClaudeProfile() (string, error) {
+// resolveClaudeProfileName returns the Claude profile for this session.
+// The SEKI_CLAUDE_PROFILE override (set by `seki exec --claude-profile`)
+// wins over cwd-based resolution from config.
+func resolveClaudeProfileName() (string, error) {
+	if name := os.Getenv("SEKI_CLAUDE_PROFILE"); name != "" {
+		return name, nil
+	}
 	cwd := os.Getenv("SEKI_CWD")
 	if cwd == "" {
 		return "", nil
 	}
-
 	cfg, err := profile.LoadConfig()
 	if err != nil {
 		return "", fmt.Errorf("load config: %w", err)
 	}
-	if cfg == nil {
-		return "", nil
-	}
+	return cfg.Resolve(cwd), nil
+}
 
-	profileName := cfg.Resolve(cwd)
+// bindClaudeProfile bind-mounts a profile-specific .credentials.json over
+// ~/.claude/.credentials.json. The profile is chosen via the
+// SEKI_CLAUDE_PROFILE override or the project's working directory.
+// Returns the resolved profile name (empty if no profile applies).
+func bindClaudeProfile() (string, error) {
+	profileName, err := resolveClaudeProfileName()
+	if err != nil {
+		return "", err
+	}
 	if profileName == "" {
 		return "", nil
 	}
@@ -937,16 +946,14 @@ func bindClaudeProfile() (string, error) {
 // the mount namespace is torn down — atomic writes (rename) inside the
 // sandbox detach the bind-mount, so the profile source file stays stale.
 func SyncBackCredentials() {
-	cwd := os.Getenv("SEKI_CWD")
-	if cwd == "" {
+	profileName, err := resolveClaudeProfileName()
+	if err != nil || profileName == "" {
 		return
 	}
-	cfg, err := profile.LoadConfig()
-	if err != nil || cfg == nil {
-		return
-	}
-	profileName := cfg.Resolve(cwd)
-	if profileName == "" || profileName == cfg.Default {
+	// The default profile's canonical storage is ~/.claude itself, so a
+	// sync back would be redundant. This also holds when --claude-profile
+	// names the default explicitly.
+	if cfg, err := profile.LoadConfig(); err == nil && cfg != nil && profileName == cfg.Default {
 		return
 	}
 	home := os.Getenv("HOME")
