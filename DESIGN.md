@@ -730,6 +730,40 @@ claude login
 # → ~/.claude-profiles/work/.credentials.json に保存される
 ```
 
+### アカウント identity の分離（~/.claude.json の oauthAccount）
+
+credentials だけの差し替えでは分離が不完全だったことが運用で判明した（2026-08-17）。
+`~/.claude.json` の `oauthAccount`（アカウント表示・機能ゲートに使われる identity 情報）が
+全プロファイル共有のままで、どのセッションも「ホストで最後に /login したアカウント」を
+名乗ってしまう。トークン層（API 課金・レートリミット）は分離できていたが、
+表示と Claude Code 内の分岐は最後のログインに引きずられていた。
+
+一方 `~/.claude.json` には共有していたい状態（`mcpServers`、`projects` の信頼状態、
+プロンプト履歴）も同居しているため、ファイル丸ごとのプロファイル分離はドリフトを生む。
+そこで **oauthAccount フィールドだけ差し替えたコピーを bind-mount** する:
+
+- **起動時** (`bindClaudeJSON`): ホストの `~/.claude.json` をスナップショットし、
+  `oauthAccount` をプロファイルの保存分（`~/.claude-profiles/<p>/oauthAccount.json`）に
+  差し替えて `~/.claude-profiles/<p>/.claude.json` に書き出し、ホストパスに bind-mount。
+  保存分がまだ無い場合はフィールドを**削除**する — Claude Code が bind 済みトークンで
+  identity を再取得するので、他プロファイルの identity を継承しない（自己修復ブートストラップ）。
+- **終了時** (`SyncBackClaudeJSON`): セッションの `oauthAccount` をプロファイルストアに保存。
+  ただし保存済み identity と `accountUuid` が一致する場合のみ更新（後述の rename detach 後は
+  他セッションの identity が混入しうるため、クロス汚染ガードとして機能する）。
+  bind が生きていれば（`os.SameFile` で判定）unmount してから非 identity フィールドを
+  ホストファイルにマージ（`projects` はキー単位マージ、`oauthAccount` はホスト側を維持）。
+  マージは flock（`~/.claude-profiles/.claude.json.seki-lock`）で seki 同士を直列化。
+
+**既知の限界**: Claude Code は `~/.claude.json` を atomic rename で頻繁に書き換えるため、
+bind は最初の書き込みで剥がれ、以降セッションはホストファイルを直接書く
+（credentials の rename detach と同じ挙動）。この間ホストファイルの `oauthAccount` は
+最後に書いたセッションのものになる — `.credentials.json` のホスト実体と同様、
+**ホストの `~/.claude.json` の identity はスクラッチ扱い**とする（seki 経由のセッションは
+毎回起動時に差し替えるので影響しない。seki 外で起動した claude だけが揺れた identity を見る）。
+
+darwin backend はこの仕組みの対象外 — mount namespace が無いため元々
+`CLAUDE_CONFIG_DIR` によるディレクトリ丸ごと分離で、identity も分離済み。
+
 ### クレデンシャル隔離との関係
 
 既存のクレデンシャル隔離（環境変数フィルタ + credential helper proxy）とは独立した仕組み。

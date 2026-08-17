@@ -474,6 +474,14 @@ func ChildSetup() (*ChildState, error) {
 		claudeProfile = name
 	}
 
+	// Bind-mount a per-profile ~/.claude.json so account identity
+	// (oauthAccount) follows the profile, not the last host login.
+	if claudeProfile != "" {
+		if err := bindClaudeJSON(claudeProfile); err != nil {
+			fmt.Fprintf(os.Stderr, "seki: claude.json profile: %v\n", err)
+		}
+	}
+
 	cs := &ChildState{}
 
 	// Open log database

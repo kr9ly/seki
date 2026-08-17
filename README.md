@@ -245,7 +245,13 @@ seki host-port add 9222
 }
 ```
 
-- `claude_profiles`: cwd のグロブで Claude Code の設定プロファイルを切り替える
+- `claude_profiles`: cwd のグロブで Claude Code の設定プロファイルを切り替える。
+  `seki exec --claude-profile <name> -- claude` で cwd 解決を上書きして明示指定できる
+  （同一プロジェクトで並列セッションにアカウントを振り分けるとき用。
+  環境変数 `SEKI_CLAUDE_PROFILE` でも同じ上書きが効く）。
+  差し替わるのは `.credentials.json`（トークン）と `~/.claude.json` の `oauthAccount`
+  （アカウント identity）。それ以外の `~/.claude.json` の中身（mcpServers、プロジェクト
+  信頼状態、履歴）は全プロファイル共有のまま
 - `sandbox_env`: sandbox 内プロセスに注入する環境変数
 - `services`: sandbox 内常駐サービス。`match` にマッチした cwd のセッションだけ起動。
   PID namespace で sandbox 終了時に道連れ保証。ログは `~/.cache/seki/services/<name>.log`。

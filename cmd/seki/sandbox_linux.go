@@ -493,6 +493,7 @@ func cmdChild() {
 
 		cmdErr := cmd.Wait()
 		netns.SyncBackCredentials()
+		netns.SyncBackClaudeJSON()
 		if cmdErr != nil {
 			if exitErr, ok := cmdErr.(*exec.ExitError); ok {
 				os.Exit(exitErr.ExitCode())
@@ -522,6 +523,7 @@ func cmdChild() {
 
 		cmdErr := cmd.Run()
 		netns.SyncBackCredentials()
+		netns.SyncBackClaudeJSON()
 		if cmdErr != nil {
 			if exitErr, ok := cmdErr.(*exec.ExitError); ok {
 				os.Exit(exitErr.ExitCode())
