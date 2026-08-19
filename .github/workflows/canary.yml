@@ -1,0 +1,24 @@
+name: claude-canary
+
+# Watches the two Claude Code behaviors seki's per-session config dirs
+# depend on (CLAUDE_CONFIG_DIR relocation, symlink write-through) against
+# the latest released binary. Scheduled so a Claude Code release that
+# breaks the contract surfaces without waiting for a seki change.
+
+on:
+  schedule:
+    - cron: "0 21 * * 1" # Tuesday 06:00 JST
+  workflow_dispatch:
+
+jobs:
+  canary:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Claude Code
+        run: curl -fsSL https://claude.ai/install.sh | bash
+      - run: ./ci/canary.sh
