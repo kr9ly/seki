@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/kr9ly/seki/internal/approval"
+	"github.com/kr9ly/seki/internal/claudecfg"
 	"github.com/kr9ly/seki/internal/credential"
 	sekidns "github.com/kr9ly/seki/internal/dns"
 	"github.com/kr9ly/seki/internal/logger"
@@ -466,21 +467,9 @@ func ChildSetup() (*ChildState, error) {
 		fmt.Fprintf(os.Stderr, "seki: ssh bind-mount: %v\n", err)
 	}
 
-	// Bind-mount Claude Code credentials for profile switching
-	var claudeProfile string
-	if name, err := bindClaudeProfile(); err != nil {
-		fmt.Fprintf(os.Stderr, "seki: claude profile: %v\n", err)
-	} else {
-		claudeProfile = name
-	}
-
-	// Bind-mount a per-profile ~/.claude.json so account identity
-	// (oauthAccount) follows the profile, not the last host login.
-	if claudeProfile != "" {
-		if err := bindClaudeJSON(claudeProfile); err != nil {
-			fmt.Fprintf(os.Stderr, "seki: claude.json profile: %v\n", err)
-		}
-	}
+	// Per-session Claude config dir: identity and credentials follow the
+	// profile, shared assets stay symlinked to ~/.claude. See claudecfg.
+	claudeProfile := setupClaudeSession()
 
 	cs := &ChildState{}
 
@@ -899,86 +888,49 @@ func resolveClaudeProfileName() (string, error) {
 	return cfg.Resolve(cwd), nil
 }
 
-// bindClaudeProfile bind-mounts a profile-specific .credentials.json over
-// ~/.claude/.credentials.json. The profile is chosen via the
-// SEKI_CLAUDE_PROFILE override or the project's working directory.
-// Returns the resolved profile name (empty if no profile applies).
-func bindClaudeProfile() (string, error) {
-	profileName, err := resolveClaudeProfileName()
-	if err != nil {
-		return "", err
-	}
-	if profileName == "" {
-		return "", nil
-	}
+// claudeSession is the config dir materialized by setupClaudeSession, held
+// for SyncBackClaudeSession. ChildSetup and the sync-back run in the same
+// __child process, so a package variable suffices.
+var claudeSession *claudecfg.Session
 
-	home := os.Getenv("HOME")
-	if home == "" {
-		return "", nil
+// setupClaudeSession materializes a per-session Claude config dir for the
+// resolved profile and exposes it to the user command via CLAUDE_CONFIG_DIR
+// (ChildSetup's environment is inherited by the user command). Returns the
+// resolved profile name (empty if no profile applies). A CLAUDE_CONFIG_DIR
+// already present in the environment is respected: the caller manages Claude
+// Code's config themselves, so seki neither redirects nor syncs back.
+func setupClaudeSession() string {
+	if os.Getenv("CLAUDE_CONFIG_DIR") != "" {
+		return ""
 	}
-
-	src, err := profile.CredentialsPath(profileName)
-	if err != nil {
-		return "", err
-	}
-
-	if err := os.MkdirAll(filepath.Dir(src), 0755); err != nil {
-		return "", fmt.Errorf("mkdir profile dir: %w", err)
-	}
-	if _, err := os.Stat(src); os.IsNotExist(err) {
-		if err := os.WriteFile(src, []byte("{}\n"), 0600); err != nil {
-			return "", fmt.Errorf("init profile credentials: %w", err)
-		}
-	}
-
-	target := filepath.Join(home, ".claude", ".credentials.json")
-	if _, err := os.Stat(filepath.Dir(target)); err != nil {
-		return "", nil
-	}
-	if _, err := os.Stat(target); os.IsNotExist(err) {
-		if err := os.WriteFile(target, []byte("{}\n"), 0600); err != nil {
-			return "", fmt.Errorf("create target: %w", err)
-		}
-	}
-
-	if err := syscall.Mount(src, target, "", syscall.MS_BIND, ""); err != nil {
-		return "", fmt.Errorf("bind mount %s -> %s: %w", src, target, err)
-	}
-
-	fmt.Fprintf(os.Stderr, "seki: claude profile: %s\n", profileName)
-	return profileName, nil
-}
-
-// SyncBackCredentials copies ~/.claude/.credentials.json back to the
-// profile-specific path. Call this after the user command exits but before
-// the mount namespace is torn down — atomic writes (rename) inside the
-// sandbox detach the bind-mount, so the profile source file stays stale.
-func SyncBackCredentials() {
 	profileName, err := resolveClaudeProfileName()
 	if err != nil || profileName == "" {
-		return
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "seki: claude profile: %v\n", err)
+		}
+		return ""
 	}
-	// The default profile's canonical storage is ~/.claude itself, so a
-	// sync back would be redundant. This also holds when --claude-profile
-	// names the default explicitly.
-	if cfg, err := profile.LoadConfig(); err == nil && cfg != nil && profileName == cfg.Default {
-		return
+	isDefault := false
+	if cfg, err := profile.LoadConfig(); err == nil && cfg != nil {
+		isDefault = profileName == cfg.Default
 	}
-	home := os.Getenv("HOME")
-	if home == "" {
-		return
-	}
-	src := filepath.Join(home, ".claude", ".credentials.json")
-	data, err := os.ReadFile(src)
-	if err != nil || len(data) <= 4 {
-		return
-	}
-	dst, err := profile.CredentialsPath(profileName)
+	sess, err := claudecfg.Setup(profileName, isDefault)
 	if err != nil {
-		return
+		fmt.Fprintf(os.Stderr, "seki: claude profile: %v\n", err)
+		return ""
 	}
-	if err := os.WriteFile(dst, data, 0600); err != nil {
-		fmt.Fprintf(os.Stderr, "seki: sync credentials back to %s: %v\n", profileName, err)
+	claudeSession = sess
+	os.Setenv("CLAUDE_CONFIG_DIR", sess.Dir)
+	fmt.Fprintf(os.Stderr, "seki: claude profile: %s\n", profileName)
+	return profileName
+}
+
+// SyncBackClaudeSession persists the session's identity, credentials, and
+// non-identity ~/.claude.json changes, then removes the session config dir.
+// Call it after the user command exits.
+func SyncBackClaudeSession() {
+	if claudeSession != nil {
+		claudeSession.SyncBack()
 	}
 }
 
@@ -1054,8 +1006,12 @@ func slirpAddHostFwd(apiSock string, hostPort, guestPort int) (int, error) {
 
 	// Parse {"return":{"id":N}} or {"error":{"desc":"..."}}
 	var resp struct {
-		Return *struct{ ID int `json:"id"` } `json:"return"`
-		Error  *struct{ Desc string `json:"desc"` } `json:"error"`
+		Return *struct {
+			ID int `json:"id"`
+		} `json:"return"`
+		Error *struct {
+			Desc string `json:"desc"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal(buf[:n], &resp); err != nil {
 		return 0, fmt.Errorf("parse response: %w", err)
