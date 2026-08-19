@@ -175,16 +175,35 @@ func (l *Logger) SessionID() string {
 	return l.session
 }
 
+// dbPath returns the log database path under the XDG data dir. The database
+// must NOT live in ~/.config/seki: the sandbox remounts that dir read-only
+// (protectSekiConfig), which blocked every in-session log write — and on a
+// fresh install even schema creation.
 func dbPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home: %w", err)
 	}
-	dir := filepath.Join(home, ".config", "seki")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", fmt.Errorf("create config dir: %w", err)
+	dataDir := os.Getenv("XDG_DATA_HOME")
+	if dataDir == "" {
+		dataDir = filepath.Join(home, ".local", "share")
 	}
-	return filepath.Join(dir, "seki.db"), nil
+	dir := filepath.Join(dataDir, "seki")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("create data dir: %w", err)
+	}
+	path := filepath.Join(dir, "seki.db")
+
+	// Migrate a database left at the old ~/.config/seki location.
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		old := filepath.Join(home, ".config", "seki", "seki.db")
+		if _, err := os.Stat(old); err == nil {
+			if err := os.Rename(old, path); err != nil {
+				fmt.Fprintf(os.Stderr, "seki: migrate log db: %v\n", err)
+			}
+		}
+	}
+	return path, nil
 }
 
 func newSessionID() string {
