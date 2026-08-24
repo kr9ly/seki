@@ -20,10 +20,15 @@
 //     Code writes through the symlinks (verified: /config settings writes
 //     resolve the link rather than replacing it).
 //
-// SyncBack persists identity and credentials to the profile store, merges
-// non-identity ~/.claude.json changes into the host file, moves any files
-// Claude Code created next to the symlinks back into ~/.claude, and removes
-// the directory.
+// Credentials do not wait for exit: StartCredentialSync reconciles the
+// session copy with the canonical store while the session runs (see
+// credsync.go), so token rotations propagate between concurrent sessions and
+// a logged-out stub never overwrites a usable login.
+//
+// SyncBack persists identity to the profile store, runs a final guarded
+// credentials push, merges non-identity ~/.claude.json changes into the host
+// file, moves any files Claude Code created next to the symlinks back into
+// ~/.claude, and removes the directory.
 package claudecfg
 
 import (
@@ -45,6 +50,9 @@ type Session struct {
 	profile   string
 	isDefault bool
 	home      string
+
+	stopSync chan struct{}
+	syncDone chan struct{}
 }
 
 // Setup builds the per-session config directory for the given profile.
@@ -61,7 +69,7 @@ func Setup(profileName string, isDefault bool) (*Session, error) {
 	s := &Session{profile: profileName, isDefault: isDefault, home: home}
 
 	sessions := filepath.Join(home, ".claude-profiles", profileName, "sessions")
-	pruneStale(sessions, s.claudeDir())
+	s.pruneStale(sessions)
 
 	s.Dir = filepath.Join(sessions, strconv.Itoa(os.Getpid()))
 	// A leftover dir from a recycled pid would leak stale state into this
@@ -129,24 +137,18 @@ func Setup(profileName string, isDefault bool) (*Session, error) {
 // never abort the remaining steps — each piece of state is worth saving on
 // its own.
 func (s *Session) SyncBack() {
+	s.stopCredentialSync()
+
 	sessionData, err := os.ReadFile(filepath.Join(s.Dir, ".claude.json"))
 	if err == nil && len(sessionData) > 4 {
 		s.saveIdentity(sessionData)
 		s.mergeToHost(sessionData)
 	}
 
-	// The session file is private, so unlike the bind-mount era its
-	// credentials can only come from this profile's own store or a /login
-	// performed in this session — safe to persist unconditionally.
-	cred, err := os.ReadFile(filepath.Join(s.Dir, ".credentials.json"))
-	if err == nil && len(cred) > 4 {
-		dst := s.credentialsPath()
-		if err := os.MkdirAll(filepath.Dir(dst), 0755); err == nil {
-			if err := os.WriteFile(dst, cred, 0600); err != nil {
-				fmt.Fprintf(os.Stderr, "seki: sync credentials back to %s: %v\n", s.profile, err)
-			}
-		}
-	}
+	// Final guarded push: only a usable login fresher than the store is
+	// persisted — a logged-out stub or a token another session already
+	// superseded must not clobber the canonical file.
+	syncCredentials(s.home, filepath.Join(s.Dir, ".credentials.json"), s.credentialsPath(), false)
 
 	salvage(s.Dir, s.claudeDir())
 	if err := os.RemoveAll(s.Dir); err != nil {
@@ -194,13 +196,7 @@ func (s *Session) mergeToHost(sessionData []byte) {
 		fmt.Fprintf(os.Stderr, "seki: merge claude.json: %v\n", err)
 		return
 	}
-	tmp := hostPath + ".seki-tmp"
-	if err := os.WriteFile(tmp, merged, 0600); err != nil {
-		fmt.Fprintf(os.Stderr, "seki: write merged claude.json: %v\n", err)
-		return
-	}
-	if err := os.Rename(tmp, hostPath); err != nil {
-		os.Remove(tmp)
+	if err := writeFileAtomic(hostPath, merged, 0600); err != nil {
 		fmt.Fprintf(os.Stderr, "seki: replace claude.json: %v\n", err)
 	}
 }
@@ -262,9 +258,11 @@ func salvage(dir, claudeDir string) {
 }
 
 // pruneStale removes session dirs whose owning process is gone (crash,
-// SIGKILL), salvaging their new entries first. Identity and credentials of a
-// stale dir are deliberately not synced — they may be older than the store.
-func pruneStale(sessions, claudeDir string) {
+// SIGKILL), salvaging their new entries first. Credentials go through the
+// guarded sync, so a /login performed in a crashed session survives if it is
+// fresher than the store. Identity is not synced — it may be older than the
+// store and there is no freshness clock to tell.
+func (s *Session) pruneStale(sessions string) {
 	entries, err := os.ReadDir(sessions)
 	if err != nil {
 		return
@@ -279,7 +277,8 @@ func pruneStale(sessions, claudeDir string) {
 			continue
 		}
 		dir := filepath.Join(sessions, e.Name())
-		salvage(dir, claudeDir)
+		salvage(dir, s.claudeDir())
+		syncCredentials(s.home, filepath.Join(dir, ".credentials.json"), s.credentialsPath(), false)
 		os.RemoveAll(dir)
 	}
 }
@@ -289,7 +288,10 @@ func pruneStale(sessions, claudeDir string) {
 // host Claude Code session can still race the merge, which is the same
 // lost-update window concurrent host sessions have natively.
 func lockClaudeJSONSync(home string) (func(), error) {
-	lockPath := filepath.Join(home, ".claude-profiles", ".claude.json.seki-lock")
+	return flockPath(filepath.Join(home, ".claude-profiles", ".claude.json.seki-lock"))
+}
+
+func flockPath(lockPath string) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
 		return nil, err
 	}

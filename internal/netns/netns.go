@@ -920,6 +920,7 @@ func setupClaudeSession() string {
 		return ""
 	}
 	claudeSession = sess
+	sess.StartCredentialSync()
 	os.Setenv("CLAUDE_CONFIG_DIR", sess.Dir)
 	fmt.Fprintf(os.Stderr, "seki: claude profile: %s\n", profileName)
 	return profileName

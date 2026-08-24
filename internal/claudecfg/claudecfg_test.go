@@ -2,6 +2,7 @@ package claudecfg
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -148,15 +149,26 @@ func setupHome(t *testing.T) string {
 		`{"oauthAccount":{"accountUuid":"host"},"numStartups":3,"projects":{"/a":{"x":1}}}`)
 
 	claudeDir := filepath.Join(home, ".claude")
-	writeFile(t, filepath.Join(claudeDir, ".credentials.json"), `{"token":"host-cred"}`)
+	writeFile(t, filepath.Join(claudeDir, ".credentials.json"), cred("host-cred", 1000))
 	writeFile(t, filepath.Join(claudeDir, "settings.json"), `{"verbose":false}`)
 	writeFile(t, filepath.Join(claudeDir, "skills", "foo.md"), "skill")
 
 	workDir := filepath.Join(home, ".claude-profiles", "work")
-	writeFile(t, filepath.Join(workDir, ".credentials.json"), `{"token":"work-cred"}`)
+	writeFile(t, filepath.Join(workDir, ".credentials.json"), cred("work-cred", 1000))
 	writeFile(t, filepath.Join(workDir, "oauthAccount.json"), `{"accountUuid":"work"}`)
 	return home
 }
+
+// cred builds a usable credentials file in Claude Code's on-disk shape.
+func cred(token string, expiresAt int64) string {
+	return fmt.Sprintf(
+		`{"claudeAiOauth":{"accessToken":"at-%s","refreshToken":"rt-%s","expiresAt":%d}}`,
+		token, token, expiresAt)
+}
+
+// stubCred is what Claude Code leaves behind after a failed refresh logs the
+// session out: the shape survives but the tokens are empty.
+const stubCred = `{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}`
 
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
@@ -196,7 +208,7 @@ func TestSetupMaterializesSessionDir(t *testing.T) {
 		t.Errorf("view numStartups = %s, want 3", view["numStartups"])
 	}
 
-	if got := readFile(t, filepath.Join(s.Dir, ".credentials.json")); got != `{"token":"work-cred"}` {
+	if got := readFile(t, filepath.Join(s.Dir, ".credentials.json")); got != cred("work-cred", 1000) {
 		t.Errorf("credentials = %s, want work store copy", got)
 	}
 	if fi, err := os.Lstat(filepath.Join(s.Dir, ".credentials.json")); err != nil || fi.Mode()&os.ModeSymlink != 0 {
@@ -222,7 +234,7 @@ func TestSetupDefaultProfileUsesHostCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
-	if got := readFile(t, filepath.Join(s.Dir, ".credentials.json")); got != `{"token":"host-cred"}` {
+	if got := readFile(t, filepath.Join(s.Dir, ".credentials.json")); got != cred("host-cred", 1000) {
 		t.Errorf("credentials = %s, want host copy for default profile", got)
 	}
 }
@@ -254,7 +266,7 @@ func TestSyncBackPersistsIdentityCredentialsAndMerge(t *testing.T) {
 	// project, and refreshed credentials.
 	writeFile(t, filepath.Join(s.Dir, ".claude.json"),
 		`{"oauthAccount":{"accountUuid":"work2"},"numStartups":4,"projects":{"/b":{"x":2}}}`)
-	writeFile(t, filepath.Join(s.Dir, ".credentials.json"), `{"token":"work-cred2"}`)
+	writeFile(t, filepath.Join(s.Dir, ".credentials.json"), cred("work-cred2", 2000))
 
 	s.SyncBack()
 
@@ -262,7 +274,7 @@ func TestSyncBackPersistsIdentityCredentialsAndMerge(t *testing.T) {
 	if got := accountUUID(t, json.RawMessage(readFile(t, filepath.Join(store, "oauthAccount.json")))); got != "work2" {
 		t.Errorf("stored oauthAccount = %s, want work2", got)
 	}
-	if got := readFile(t, filepath.Join(store, ".credentials.json")); got != `{"token":"work-cred2"}` {
+	if got := readFile(t, filepath.Join(store, ".credentials.json")); got != cred("work-cred2", 2000) {
 		t.Errorf("stored credentials = %s, want refreshed copy", got)
 	}
 
@@ -298,12 +310,112 @@ func TestSyncBackDefaultProfileCredentialsToHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
-	writeFile(t, filepath.Join(s.Dir, ".credentials.json"), `{"token":"host-cred2"}`)
+	writeFile(t, filepath.Join(s.Dir, ".credentials.json"), cred("host-cred2", 2000))
 
 	s.SyncBack()
 
-	if got := readFile(t, filepath.Join(home, ".claude", ".credentials.json")); got != `{"token":"host-cred2"}` {
+	if got := readFile(t, filepath.Join(home, ".claude", ".credentials.json")); got != cred("host-cred2", 2000) {
 		t.Errorf("host credentials = %s, want refreshed copy", got)
+	}
+}
+
+func TestSyncBackRejectsLoggedOutStub(t *testing.T) {
+	home := setupHome(t)
+
+	s, err := Setup("personal", true)
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	// A failed refresh logged this session out; the store still holds a
+	// usable login that must survive.
+	writeFile(t, filepath.Join(s.Dir, ".credentials.json"), stubCred)
+
+	s.SyncBack()
+
+	if got := readFile(t, filepath.Join(home, ".claude", ".credentials.json")); got != cred("host-cred", 1000) {
+		t.Errorf("host credentials = %s, want untouched store copy", got)
+	}
+}
+
+func TestSyncBackRejectsStalerCredentials(t *testing.T) {
+	home := setupHome(t)
+
+	s, err := Setup("work", false)
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	// Another session rotated the token while this one ran.
+	store := filepath.Join(home, ".claude-profiles", "work", ".credentials.json")
+	writeFile(t, store, cred("rotated", 5000))
+	writeFile(t, filepath.Join(s.Dir, ".credentials.json"), cred("old", 1000))
+
+	s.SyncBack()
+
+	if got := readFile(t, store); got != cred("rotated", 5000) {
+		t.Errorf("stored credentials = %s, want the fresher rotation kept", got)
+	}
+}
+
+func TestSyncCredentialsPushesFresherSession(t *testing.T) {
+	home := setupHome(t)
+	sess := filepath.Join(home, "sess-creds.json")
+	canon := filepath.Join(home, ".claude-profiles", "work", ".credentials.json")
+	writeFile(t, sess, cred("fresh", 9000))
+
+	syncCredentials(home, sess, canon, true)
+
+	if got := readFile(t, canon); got != cred("fresh", 9000) {
+		t.Errorf("canonical = %s, want fresher session copy pushed", got)
+	}
+}
+
+func TestSyncCredentialsPullsFresherCanonical(t *testing.T) {
+	home := setupHome(t)
+	sess := filepath.Join(home, "sess-creds.json")
+	canon := filepath.Join(home, ".claude-profiles", "work", ".credentials.json")
+	writeFile(t, canon, cred("peer-login", 9000))
+	// The session got logged out (stub) — the peer's login must flow in.
+	writeFile(t, sess, stubCred)
+
+	syncCredentials(home, sess, canon, true)
+
+	if got := readFile(t, sess); got != cred("peer-login", 9000) {
+		t.Errorf("session copy = %s, want fresher canonical pulled", got)
+	}
+}
+
+func TestSyncCredentialsNoPullWithoutPullBack(t *testing.T) {
+	home := setupHome(t)
+	sess := filepath.Join(home, "sess-creds.json")
+	canon := filepath.Join(home, ".claude-profiles", "work", ".credentials.json")
+	writeFile(t, canon, cred("peer-login", 9000))
+	writeFile(t, sess, stubCred)
+
+	syncCredentials(home, sess, canon, false)
+
+	if got := readFile(t, sess); got != stubCred {
+		t.Errorf("session copy = %s, want untouched without pullBack", got)
+	}
+}
+
+func TestCredExpiry(t *testing.T) {
+	cases := []struct {
+		name   string
+		data   string
+		expiry int64
+		ok     bool
+	}{
+		{"usable", cred("x", 42), 42, true},
+		{"logged-out stub", stubCred, 0, false},
+		{"missing refresh token", `{"claudeAiOauth":{"accessToken":"at","expiresAt":7}}`, 0, false},
+		{"empty seed", "{}\n", 0, false},
+		{"corrupt", "not json", 0, false},
+	}
+	for _, c := range cases {
+		expiry, ok := credExpiry([]byte(c.data))
+		if expiry != c.expiry || ok != c.ok {
+			t.Errorf("%s: credExpiry = (%d, %v), want (%d, %v)", c.name, expiry, ok, c.expiry, c.ok)
+		}
 	}
 }
 
@@ -354,5 +466,39 @@ func TestPruneStaleRemovesDeadSessionDirs(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(sessions, "not-a-pid")); err != nil {
 		t.Error("non-pid entry must be left alone")
+	}
+}
+
+func TestPruneStaleSyncsFresherCredentials(t *testing.T) {
+	home := setupHome(t)
+	sessions := filepath.Join(home, ".claude-profiles", "work", "sessions")
+
+	// A /login happened in a session that later crashed — fresher than the
+	// store, so it must survive the prune.
+	writeFile(t, filepath.Join(sessions, "99999999", ".credentials.json"), cred("crashed-login", 9000))
+
+	if _, err := Setup("work", false); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	store := filepath.Join(home, ".claude-profiles", "work", ".credentials.json")
+	if got := readFile(t, store); got != cred("crashed-login", 9000) {
+		t.Errorf("stored credentials = %s, want crashed session's fresher login", got)
+	}
+}
+
+func TestPruneStaleRejectsStalerCredentials(t *testing.T) {
+	home := setupHome(t)
+	sessions := filepath.Join(home, ".claude-profiles", "work", "sessions")
+
+	writeFile(t, filepath.Join(sessions, "99999999", ".credentials.json"), cred("ancient", 1))
+
+	if _, err := Setup("work", false); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	store := filepath.Join(home, ".claude-profiles", "work", ".credentials.json")
+	if got := readFile(t, store); got != cred("work-cred", 1000) {
+		t.Errorf("stored credentials = %s, want store kept over staler stale-dir copy", got)
 	}
 }
