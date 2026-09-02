@@ -870,24 +870,6 @@ func bindSSH() error {
 	return nil
 }
 
-// resolveClaudeProfileName returns the Claude profile for this session.
-// The SEKI_CLAUDE_PROFILE override (set by `seki exec --claude-profile`)
-// wins over cwd-based resolution from config.
-func resolveClaudeProfileName() (string, error) {
-	if name := os.Getenv("SEKI_CLAUDE_PROFILE"); name != "" {
-		return name, nil
-	}
-	cwd := os.Getenv("SEKI_CWD")
-	if cwd == "" {
-		return "", nil
-	}
-	cfg, err := profile.LoadConfig()
-	if err != nil {
-		return "", fmt.Errorf("load config: %w", err)
-	}
-	return cfg.Resolve(cwd), nil
-}
-
 // claudeSession is the config dir materialized by setupClaudeSession, held
 // for SyncBackClaudeSession. ChildSetup and the sync-back run in the same
 // __child process, so a package variable suffices.
@@ -896,34 +878,20 @@ var claudeSession *claudecfg.Session
 // setupClaudeSession materializes a per-session Claude config dir for the
 // resolved profile and exposes it to the user command via CLAUDE_CONFIG_DIR
 // (ChildSetup's environment is inherited by the user command). Returns the
-// resolved profile name (empty if no profile applies). A CLAUDE_CONFIG_DIR
-// already present in the environment is respected: the caller manages Claude
-// Code's config themselves, so seki neither redirects nor syncs back.
+// resolved profile name (empty if no profile applies).
 func setupClaudeSession() string {
-	if os.Getenv("CLAUDE_CONFIG_DIR") != "" {
-		return ""
-	}
-	profileName, err := resolveClaudeProfileName()
-	if err != nil || profileName == "" {
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "seki: claude profile: %v\n", err)
-		}
-		return ""
-	}
-	isDefault := false
-	if cfg, err := profile.LoadConfig(); err == nil && cfg != nil {
-		isDefault = profileName == cfg.Default
-	}
-	sess, err := claudecfg.Setup(profileName, isDefault)
+	sess, name, err := claudecfg.SetupFromEnv()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "seki: claude profile: %v\n", err)
 		return ""
 	}
+	if sess == nil {
+		return ""
+	}
 	claudeSession = sess
-	sess.StartCredentialSync()
 	os.Setenv("CLAUDE_CONFIG_DIR", sess.Dir)
-	fmt.Fprintf(os.Stderr, "seki: claude profile: %s\n", profileName)
-	return profileName
+	fmt.Fprintf(os.Stderr, "seki: claude profile: %s\n", name)
+	return name
 }
 
 // SyncBackClaudeSession persists the session's identity, credentials, and

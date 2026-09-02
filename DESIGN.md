@@ -761,8 +761,12 @@ bind は最初の書き込みで剥がれ、以降セッションはホストフ
 **ホストの `~/.claude.json` の identity はスクラッチ扱い**とする（seki 経由のセッションは
 毎回起動時に差し替えるので影響しない。seki 外で起動した claude だけが揺れた identity を見る）。
 
-darwin backend はこの仕組みの対象外 — mount namespace が無いため元々
-`CLAUDE_CONFIG_DIR` によるディレクトリ丸ごと分離で、identity も分離済み。
+darwin backend も同じ per-session `CLAUDE_CONFIG_DIR` 方式（`internal/claudecfg`）を使う。
+以前は `~/.claude-profiles/<p>` 自体を `CLAUDE_CONFIG_DIR` にしていたため settings / hooks /
+skills / transcripts までプロファイル別に分裂していた。初回起動時に旧レイアウトの
+`<p>/.claude.json` から `oauthAccount.json` を、default プロファイルは `<p>/.credentials.json`
+から `~/.claude/.credentials.json` を（鮮度比較つきで）取り込む。旧 `<p>/settings.json` 等は
+参照されなくなるので、必要なら手動で `~/.claude` に統合してから削除する。
 
 ### クレデンシャル隔離との関係
 
@@ -995,7 +999,7 @@ git 以外の直接の ssh 実行はプロキシを知らないため Seatbelt �
 - **PID namespace のカーネル保証**: サービス宣言機能の道連れ停止がベストエフォートに落ちる。
   darwin ではサービス宣言を当面スコープ外とし、必要になった時点で kqueue 監視を設計する
 - **プロファイル切り替えの bind-mount**: mount namespace がないため、credentials の
-  bind-mount 方式は使えない。環境変数（`CLAUDE_CONFIG_DIR` 等）ベースの方式に置き換える
+  bind-mount 方式は使えない。per-session `CLAUDE_CONFIG_DIR`（claudecfg）を Linux と共用する
 
 ### ビルド・配布
 

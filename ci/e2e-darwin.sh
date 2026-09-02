@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke test of the darwin Seatbelt backend on a GitHub Actions macOS
-# runner: basic exec, per-profile CLAUDE_CONFIG_DIR, direct-outbound deny
+# runner: the shared per-session CLAUDE_CONFIG_DIR suite, direct-outbound deny
 # (Seatbelt), and allow/deny decisions through the CONNECT proxy.
 set -euo pipefail
 
@@ -17,11 +17,8 @@ EOF
 
 cd "$FAKEHOME/proj"
 
-echo "--- exec + per-profile CLAUDE_CONFIG_DIR"
-OUT=$(HOME=$FAKEHOME "$SEKI" exec --claude-profile work -- /bin/sh -c 'echo "CFG=$CLAUDE_CONFIG_DIR"; echo sandbox-ok')
-echo "$OUT"
-echo "$OUT" | grep -q sandbox-ok
-echo "$OUT" | grep -q "CFG=$FAKEHOME/.claude-profiles/work"
+echo "--- per-session CLAUDE_CONFIG_DIR (shared suite)"
+HOME=$FAKEHOME "$(dirname "$SEKI")/ci/e2e-claudecfg.sh" "$SEKI"
 
 echo "--- Seatbelt blocks direct outbound (proxy bypassed)"
 if HOME=$FAKEHOME "$SEKI" exec -- /usr/bin/curl -s --noproxy '*' --connect-timeout 10 https://example.com >/dev/null 2>&1; then

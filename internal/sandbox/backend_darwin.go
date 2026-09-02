@@ -30,6 +30,7 @@ import (
 
 	"github.com/kr9ly/seki/internal/approval"
 	"github.com/kr9ly/seki/internal/bridge"
+	"github.com/kr9ly/seki/internal/claudecfg"
 	"github.com/kr9ly/seki/internal/credential"
 	"github.com/kr9ly/seki/internal/logger"
 	"github.com/kr9ly/seki/internal/profile"
@@ -56,12 +57,21 @@ func (darwinBackend) Exec(args []string) (Instance, error) {
 
 // darwinSandbox is a running Seatbelt sandbox and its host-side services.
 type darwinSandbox struct {
-	cmd     *exec.Cmd
-	cleanup []func()
+	cmd           *exec.Cmd
+	cleanup       []func()
+	claudeSession *claudecfg.Session
 }
 
+// Wait blocks until the sandboxed command exits, then syncs the per-session
+// Claude config dir back (here rather than Close: cmdExec os.Exit()s on a
+// non-zero status before deferred Close runs).
 func (sb *darwinSandbox) Wait() error {
-	return sb.cmd.Wait()
+	err := sb.cmd.Wait()
+	if sb.claudeSession != nil {
+		sb.claudeSession.SyncBack()
+		sb.claudeSession = nil
+	}
+	return err
 }
 
 func (sb *darwinSandbox) Close() {
@@ -276,10 +286,10 @@ func darwinExec(args []string) (*darwinSandbox, error) {
 	sb.cleanup = append(sb.cleanup, func() { cp.Close() })
 	proxyAddr := cp.Addr()
 
-	// Claude profile switching: no mount namespace on darwin, so instead of
-	// bind-mounting .credentials.json we point CLAUDE_CONFIG_DIR at a
-	// per-profile directory (credentials live there directly; no sync-back).
-	claudeProfile, claudeEnv := resolveClaudeProfile(cwd, home)
+	// Claude profile switching: same per-session config dir as Linux
+	// (identity + credentials follow the profile, everything else symlinked
+	// to ~/.claude so settings/hooks/skills stay shared). See claudecfg.
+	claudeProfile, claudeEnv := resolveClaudeProfile(sb)
 
 	// Session status for watch.
 	emitEvent(socket.Event{
@@ -318,29 +328,22 @@ func darwinExec(args []string) (*darwinSandbox, error) {
 	return sb, nil
 }
 
-// resolveClaudeProfile maps the working directory to a Claude profile and
-// returns extra env vars pointing Claude Code at the per-profile config dir.
-// The SEKI_CLAUDE_PROFILE override (set by `seki exec --claude-profile`)
-// wins over cwd-based resolution.
-func resolveClaudeProfile(cwd, home string) (string, []string) {
-	name := os.Getenv("SEKI_CLAUDE_PROFILE")
-	if name == "" {
-		cfg, err := profile.LoadConfig()
-		if err != nil || cfg == nil || cwd == "" {
-			return "", nil
-		}
-		name = cfg.Resolve(cwd)
-	}
-	if name == "" {
+// resolveClaudeProfile materializes the per-session Claude config dir for
+// the resolved profile (see claudecfg.SetupFromEnv for the resolution order)
+// and returns the profile name plus the env var pointing Claude Code at it.
+// The session is held on sb so Wait can sync it back after the command exits.
+func resolveClaudeProfile(sb *darwinSandbox) (string, []string) {
+	sess, name, err := claudecfg.SetupFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seki: claude profile: %v\n", err)
 		return "", nil
 	}
-	dir := filepath.Join(home, ".claude-profiles", name)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		fmt.Fprintf(os.Stderr, "seki: claude profile dir: %v\n", err)
+	if sess == nil {
 		return "", nil
 	}
+	sb.claudeSession = sess
 	fmt.Fprintf(os.Stderr, "seki: claude profile: %s\n", name)
-	return name, []string{"CLAUDE_CONFIG_DIR=" + dir}
+	return name, []string{"CLAUDE_CONFIG_DIR=" + sess.Dir}
 }
 
 // buildSandboxEnv constructs the sandboxed command's environment: proxy

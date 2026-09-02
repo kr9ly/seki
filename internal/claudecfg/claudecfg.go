@@ -91,6 +91,14 @@ func Setup(profileName string, isDefault bool) (*Session, error) {
 	} else if err != nil {
 		return nil, err
 	}
+	s.migrateLegacyIdentity()
+	if isDefault {
+		// The legacy darwin layout kept even the default profile's login in
+		// the profile store; adopt it if it is the fresher usable login.
+		if legacy, err := profile.CredentialsPath(profileName); err == nil {
+			syncCredentials(home, legacy, s.credentialsPath(), false)
+		}
+	}
 	storedOA, err := os.ReadFile(s.oauthAccountPath())
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
@@ -376,4 +384,67 @@ func mergeProjects(hostRaw, sessionRaw json.RawMessage) json.RawMessage {
 		return sessionRaw
 	}
 	return out
+}
+
+// ResolveProfileName returns the Claude profile for this seki session: the
+// SEKI_CLAUDE_PROFILE override (`seki exec --claude-profile`) wins over
+// cwd-based resolution from config via SEKI_CWD. Empty means no profile
+// applies. The returned config is nil when it was not needed.
+func ResolveProfileName() (string, *profile.Config, error) {
+	if name := os.Getenv("SEKI_CLAUDE_PROFILE"); name != "" {
+		return name, nil, nil
+	}
+	cwd := os.Getenv("SEKI_CWD")
+	if cwd == "" {
+		return "", nil, nil
+	}
+	cfg, err := profile.LoadConfig()
+	if err != nil {
+		return "", nil, fmt.Errorf("load config: %w", err)
+	}
+	if cfg == nil {
+		return "", nil, nil
+	}
+	return cfg.Resolve(cwd), cfg, nil
+}
+
+// SetupFromEnv resolves the profile (ResolveProfileName) and materializes
+// its config directory, shared by the linux and darwin backends. An existing
+// CLAUDE_CONFIG_DIR means the caller manages Claude Code's config themselves:
+// seki neither redirects nor syncs back. Credential sync is started; the
+// caller must call SyncBack after the user command exits. A nil session with
+// a nil error means no profile applies.
+func SetupFromEnv() (*Session, string, error) {
+	if os.Getenv("CLAUDE_CONFIG_DIR") != "" {
+		return nil, "", nil
+	}
+	name, cfg, err := ResolveProfileName()
+	if err != nil || name == "" {
+		return nil, "", err
+	}
+	if cfg == nil {
+		cfg, _ = profile.LoadConfig()
+	}
+	isDefault := cfg != nil && name == cfg.Default
+	sess, err := Setup(name, isDefault)
+	if err != nil {
+		return nil, "", err
+	}
+	sess.StartCredentialSync()
+	return sess, name, nil
+}
+
+// migrateLegacyIdentity seeds the profile store from the layout the darwin
+// backend used before per-session dirs: ~/.claude-profiles/<p> itself was
+// CLAUDE_CONFIG_DIR, so Claude Code left a .claude.json (carrying the
+// profile's oauthAccount) there. Only runs when the store has no identity yet.
+func (s *Session) migrateLegacyIdentity() {
+	if _, err := os.Stat(s.oauthAccountPath()); err == nil {
+		return
+	}
+	legacy, err := os.ReadFile(filepath.Join(s.home, ".claude-profiles", s.profile, ".claude.json"))
+	if err != nil {
+		return
+	}
+	s.saveIdentity(legacy)
 }
