@@ -5,12 +5,17 @@ name: release
 # attaches them to the GitHub Release for that tag. If the release already
 # exists (notes written by hand before tagging), assets are added to it;
 # otherwise a draft release with auto-generated notes is created so the
-# notes can be edited before publishing.
+# notes can be edited before publishing. workflow_dispatch with a tag
+# rebuilds and re-attaches the assets for an existing tag.
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and attach assets for"
+        required: true
 
 permissions:
   contents: write
@@ -20,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -28,7 +35,7 @@ jobs:
       - name: Attach binaries to the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           if ! gh release view "$TAG" >/dev/null 2>&1; then
