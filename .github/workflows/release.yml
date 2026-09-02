@@ -1,0 +1,38 @@
+name: release
+
+# Builds the release binaries (make release: CGO-free cross-compile for
+# linux/arm64, linux/amd64, darwin/arm64 + SHA256SUMS) on a tag push and
+# attaches them to the GitHub Release for that tag. If the release already
+# exists (notes written by hand before tagging), assets are added to it;
+# otherwise a draft release with auto-generated notes is created so the
+# notes can be edited before publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - run: make release
+      - name: Attach binaries to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --generate-notes --title "$TAG"
+          fi
+          gh release upload "$TAG" --clobber \
+            dist/seki-linux-arm64 dist/seki-linux-amd64 dist/seki-darwin-arm64 dist/SHA256SUMS

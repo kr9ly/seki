@@ -10,7 +10,8 @@ install:
 	go build -o ~/.local/bin/seki ./cmd/seki
 
 # Cross-compile release binaries. CGO-free (sqlite is modernc pure-Go),
-# so this works from any host without a cross toolchain.
+# so this works from any host without a cross toolchain. Run by
+# .github/workflows/release.yml on tag push; local runs are for checking.
 release:
 	rm -rf $(DIST) && mkdir -p $(DIST)
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o $(DIST)/seki-linux-arm64 ./cmd/seki
