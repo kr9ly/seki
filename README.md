@@ -268,7 +268,7 @@ seki host-port add 9222
 - `loopback_notrack`: sandbox内のループバック通信をconntrackから外す（Linuxのみ、既定は `false`）。
   sandbox内でサーバーと負荷ツールを動かす計測向け。対象は送信元と宛先がどちらも
   `127.0.0.0/8` の通信で、DNS（ポート53と5353）は除く。外向きの通信の検問は変わらない。
-  IPv6の `::1` はもともとconntrackを通らない
+  IPv6の `::1` はもともとconntrackを通らない。`nft` コマンドがあればnftで規則を入れ、無ければiptablesで入れる
 
 ## 8. rules.json 完全プリセット（コピペ用）
 

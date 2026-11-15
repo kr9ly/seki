@@ -5,6 +5,7 @@ package netns
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 )
@@ -63,10 +64,14 @@ func applyNetnsSysctls(sysctls map[string]string) {
 	}
 }
 
-// loNotrackChain is the raw-table chain holding the loopback notrack rules.
+// loNotrackTable is the nft table holding the loopback notrack rules. It is
+// separate from the tables iptables manages, so the two never collide.
+const loNotrackTable = "seki_lo_notrack"
+
+// loNotrackChain is the raw-table chain used by the iptables fallback.
 const loNotrackChain = "SEKI_LO_NOTRACK"
 
-// loopbackNotrackRules returns the iptables argument lists that exempt
+// loopbackNotrackRuleset returns the nft ruleset that exempts
 // sandbox-internal loopback traffic from connection tracking.
 //
 // Only packets with both source and destination in 127.0.0.0/8 are
@@ -78,36 +83,61 @@ const loNotrackChain = "SEKI_LO_NOTRACK"
 //   - DNS via resolv.conf (127.0.0.1:53, DNATed to DNSPort) is 127/8 on both
 //     ends, so ports 53 and DNSPort are excluded explicitly.
 //
-// The PREROUTING hook is covered as well as OUTPUT; a packet already tracked
-// at OUTPUT keeps its conntrack entry across lo and is left alone there.
-func loopbackNotrackRules() [][]string {
+// The rules run on every loopback packet, so they are kept short: one rule
+// in the base chain, and the DNS ports matched as a set. Only the output
+// hook is needed. A packet keeps its untracked mark across lo, so conntrack
+// skips it at prerouting too, and nothing with 127/8 on both ends reaches
+// prerouting without passing output first.
+func loopbackNotrackRuleset() string {
+	ports := "{ 53, " + DNSPort + " }"
+	return "table ip " + loNotrackTable + ` {
+	chain output {
+		type filter hook output priority raw; policy accept;
+		oif "lo" ip saddr 127.0.0.0/8 ip daddr 127.0.0.0/8 jump lo
+	}
+	chain lo {
+		meta l4proto { tcp, udp } th dport ` + ports + ` return
+		meta l4proto { tcp, udp } th sport ` + ports + ` return
+		notrack
+	}
+}
+`
+}
+
+// loopbackNotrackIptablesRules is the fallback for hosts without nft. It has
+// the same meaning as loopbackNotrackRuleset, at a higher per-packet cost.
+func loopbackNotrackIptablesRules() [][]string {
 	rules := [][]string{{"-t", "raw", "-N", loNotrackChain}}
 	for _, proto := range []string{"udp", "tcp"} {
-		for _, port := range []string{"53", DNSPort} {
-			for _, dir := range []string{"--dport", "--sport"} {
-				rules = append(rules, []string{"-t", "raw", "-A", loNotrackChain,
-					"-p", proto, dir, port, "-j", "RETURN"})
-			}
-		}
+		// --ports matches the source or the destination port.
+		rules = append(rules, []string{"-t", "raw", "-A", loNotrackChain,
+			"-p", proto, "-m", "multiport", "--ports", "53," + DNSPort, "-j", "RETURN"})
 	}
 	rules = append(rules,
 		[]string{"-t", "raw", "-A", loNotrackChain, "-j", "CT", "--notrack"},
 		[]string{"-t", "raw", "-A", "OUTPUT", "-o", "lo",
 			"-s", "127.0.0.0/8", "-d", "127.0.0.0/8", "-j", loNotrackChain},
-		[]string{"-t", "raw", "-A", "PREROUTING", "-i", "lo",
-			"-s", "127.0.0.0/8", "-d", "127.0.0.0/8", "-j", loNotrackChain},
 	)
 	return rules
 }
 
-// setupLoopbackNotrack applies loopbackNotrackRules. The jump rules come
-// last, so a failure partway leaves the chain unreferenced and tracking
-// unchanged.
+// setupLoopbackNotrack loads loopbackNotrackRuleset with nft, or applies the
+// iptables fallback when nft is not installed. nft loads the ruleset
+// atomically. In the fallback the jump rule comes last, so a failure partway
+// leaves the chain unreferenced and tracking unchanged.
 func setupLoopbackNotrack() error {
-	for _, args := range loopbackNotrackRules() {
-		if err := run("iptables", args...); err != nil {
-			return err
+	if _, err := exec.LookPath("nft"); err != nil {
+		for _, args := range loopbackNotrackIptablesRules() {
+			if err := run("iptables", args...); err != nil {
+				return err
+			}
 		}
+		return nil
+	}
+	cmd := exec.Command("nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(loopbackNotrackRuleset())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("nft: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }

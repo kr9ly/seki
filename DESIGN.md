@@ -163,18 +163,32 @@ sandbox内で負荷試験を行うための設定。どちらも名前空間の�
 
 `netns_sysctls` は、名前空間ごとのsysctlをChildSetupで書く。この時点のプロセスは、名前空間を所有するuser namespaceのuid 0である。ユーザーコマンドは入れ子のuser namespaceで動くので、後から値を変えられない。キーは許可リスト（`internal/netns/tuning.go`）に限る。ルーティングやnetfilterに関わるキーは、検問に影響するので許可しない。
 
-`loopback_notrack` は、rawテーブルでループバック通信をconntrackから外す。
+`loopback_notrack` は、rawの優先度のhookでループバック通信をconntrackから外す。規則はnftで直接読み込む。
 
-```bash
-iptables -t raw -N SEKI_LO_NOTRACK
-# DNS: resolv.conf の 127.0.0.1:53 は 127.0.0.1:5353 へ DNAT されるので、追跡を残す
-iptables -t raw -A SEKI_LO_NOTRACK -p {udp,tcp} {--dport,--sport} {53,5353} -j RETURN
-iptables -t raw -A SEKI_LO_NOTRACK -j CT --notrack
-iptables -t raw -A OUTPUT     -o lo -s 127.0.0.0/8 -d 127.0.0.0/8 -j SEKI_LO_NOTRACK
-iptables -t raw -A PREROUTING -i lo -s 127.0.0.0/8 -d 127.0.0.0/8 -j SEKI_LO_NOTRACK
+```
+table ip seki_lo_notrack {
+	chain output {
+		type filter hook output priority raw; policy accept;
+		oif "lo" ip saddr 127.0.0.0/8 ip daddr 127.0.0.0/8 jump lo
+	}
+	chain lo {
+		# DNS: resolv.conf の 127.0.0.1:53 は 127.0.0.1:5353 へ DNAT されるので、追跡を残す
+		meta l4proto { tcp, udp } th dport { 53, 5353 } return
+		meta l4proto { tcp, udp } th sport { 53, 5353 } return
+		notrack
+	}
+}
 ```
 
-対象を「送信元と宛先がどちらも127.0.0.0/8」に限る理由: NATを使う検問の流れは、DNS以外すべて片側がtap0のアドレスになる。プロキシへのREDIRECTと外部DNSのDNATは、送信元がtap0のアドレスのまま残る。ホストからのポートフォワードは、相手がslirpのゲートウェイになる。`-o lo` だけで外すと、プロキシからの応答（127.0.0.1:10200 → tap0のアドレス）のNATの逆変換が壊れる。
+対象を「送信元と宛先がどちらも127.0.0.0/8」に限る理由: NATを使う検問の流れは、DNS以外すべて片側がtap0のアドレスになる。プロキシへのREDIRECTと外部DNSのDNATは、送信元がtap0のアドレスのまま残る。ホストからのポートフォワードは、相手がslirpのゲートウェイになる。`oif "lo"` だけで外すと、プロキシからの応答（127.0.0.1:10200 → tap0のアドレス）のNATの逆変換が壊れる。
+
+この規則はループバックのパケット1つごとに評価されるので、短く保つ。
+
+- hookはoutputだけにする。outputでnotrackされたパケットは、loを通ってもuntrackedのまま届き、preroutingのconntrackは何もしない。送信元と宛先がどちらも127.0.0.0/8のパケットは、必ずoutputを通る
+- DNSのポートは集合で照合する。ポートごとに規則を並べない
+- iptablesの互換の経路（`-j CT --notrack`）を使わない。規則ごとのカウンタとxtの呼び出しが、パケットごとのコストになる
+
+nftが無いホストでは、同じ意味の規則をiptablesで入れる（`-m multiport --ports 53,5353` と `-j CT --notrack`）。
 
 ### ホスト安全性保証
 
