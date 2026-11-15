@@ -190,6 +190,19 @@ table ip seki_lo_notrack {
 
 nftが無いホストでは、同じ意味の規則をiptablesで入れる（`-m multiport --ports 53,5353` と `-j CT --notrack`）。
 
+### 負荷試験用の名前空間（`seki isolate`）
+
+`seki isolate -- <コマンド>` は、新しいuser namespaceとnetwork namespaceでコマンドを実行する。この名前空間にはloだけがあり、netfilterの規則が無い。規則が無い名前空間にはhookが登録されないので、ループバックのパケットはconntrackも規則の評価も通らない。
+
+検問への影響は無い。新しい名前空間には外への経路が無く、検問する通信が存在しない。sandboxの名前空間の規則には触らない。
+
+手順（`cmd/seki/isolate_linux.go`）:
+
+1. 外の名前空間で、許可リストのsysctlの現在値を読む
+2. `CLONE_NEWUSER` と `CLONE_NEWNET` で自分自身を起動する。uidとgidは同じ値にマップする。CAP_NET_ADMINをambientで渡す
+3. 中でloを起動し、読んだsysctlを書く
+4. ambientのケーパビリティを消してから、コマンドをexecする。uidが0でないので、コマンドはケーパビリティを持たない
+
 ### ホスト安全性保証
 
 seki が crash・SIGKILL されてもホスト環境を破壊しないことを構造的に保証する。
@@ -470,6 +483,9 @@ seki query --since=5s --format=hook
 # learning mode の切替
 seki mode learning
 seki mode enforce
+
+# 負荷試験: 規則の無いネットワーク名前空間でコマンドを実行 (Linux)
+seki isolate -- ./bench.sh
 ```
 
 ## メタデータ保護

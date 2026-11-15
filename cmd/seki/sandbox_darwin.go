@@ -38,3 +38,12 @@ func cmdForward() {
 func cmdHostPort() {
 	fmt.Fprintln(os.Stderr, "seki host-port: not needed on macOS — host localhost ports are directly reachable from the sandbox.")
 }
+
+// cmdIsolate has no darwin implementation: there is no network namespace to
+// create, and the darwin backend adds no per-packet cost on loopback.
+func cmdIsolate() {
+	fmt.Fprintln(os.Stderr, "seki isolate: Linux only (needs a network namespace)")
+	os.Exit(1)
+}
+
+func cmdIsolateInner() { darwinNoNamespace("__isolate") }

@@ -141,3 +141,27 @@ func setupLoopbackNotrack() error {
 	}
 	return nil
 }
+
+// CurrentNetnsSysctls reads the allowlisted sysctls from the calling
+// process's network namespace. seki isolate uses it to carry the sandbox's
+// values into the nested namespace, which would otherwise start from the
+// kernel defaults. Keys that cannot be read are left out.
+func CurrentNetnsSysctls() map[string]string {
+	out := make(map[string]string, len(allowedNetnsSysctls))
+	for key := range allowedNetnsSysctls {
+		data, err := os.ReadFile("/proc/sys/" + strings.ReplaceAll(key, ".", "/"))
+		if err != nil {
+			continue
+		}
+		// Multi-value sysctls are tab-separated when read back.
+		out[key] = strings.Join(strings.Fields(string(data)), " ")
+	}
+	return out
+}
+
+// ApplyNetnsSysctls writes sysctls into the calling process's network
+// namespace, with the same allowlist and skip-on-failure behavior as the
+// sandbox setup.
+func ApplyNetnsSysctls(sysctls map[string]string) {
+	applyNetnsSysctls(sysctls)
+}

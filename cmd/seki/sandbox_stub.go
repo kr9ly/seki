@@ -15,10 +15,12 @@ func platformUnsupported(cmd string) {
 	os.Exit(1)
 }
 
-func cmdNsSetup()   { platformUnsupported("__ns-setup") }
-func cmdNsExec()    { platformUnsupported("__ns-exec") }
-func cmdChild()     { platformUnsupported("__child") }
-func cmdNewUIDMap() { platformUnsupported("newuidmap") }
-func cmdNewGIDMap() { platformUnsupported("newgidmap") }
-func cmdForward()   { platformUnsupported("forward") }
-func cmdHostPort()  { platformUnsupported("host-port") }
+func cmdNsSetup()      { platformUnsupported("__ns-setup") }
+func cmdNsExec()       { platformUnsupported("__ns-exec") }
+func cmdChild()        { platformUnsupported("__child") }
+func cmdNewUIDMap()    { platformUnsupported("newuidmap") }
+func cmdNewGIDMap()    { platformUnsupported("newgidmap") }
+func cmdForward()      { platformUnsupported("forward") }
+func cmdHostPort()     { platformUnsupported("host-port") }
+func cmdIsolate()      { platformUnsupported("isolate") }
+func cmdIsolateInner() { platformUnsupported("__isolate") }

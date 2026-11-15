@@ -142,3 +142,17 @@ func TestLoopbackNotrackIptablesRules(t *testing.T) {
 		t.Errorf("jump rule must come last: %v", joined)
 	}
 }
+
+// seki isolate reads the sysctls here and writes them back in the nested
+// namespace, so every value read must pass the validation applied on write.
+func TestCurrentNetnsSysctlsRoundTrip(t *testing.T) {
+	got := CurrentNetnsSysctls()
+	if len(got) == 0 {
+		t.Skip("no allowlisted sysctl is readable here")
+	}
+	for key, value := range got {
+		if err := validateNetnsSysctl(key, value); err != nil {
+			t.Errorf("CurrentNetnsSysctls()[%q] = %q: %v", key, value, err)
+		}
+	}
+}
