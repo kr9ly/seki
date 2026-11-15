@@ -661,13 +661,6 @@ func ChildSetup() (*ChildState, error) {
 		return nil, fmt.Errorf("iptables: %w", err)
 	}
 
-	// Opt-in: take sandbox-internal loopback traffic out of conntrack.
-	if tuning.LoopbackNotrack {
-		if err := setupLoopbackNotrack(); err != nil {
-			fmt.Fprintf(os.Stderr, "seki: loopback_notrack: %v (loopback stays tracked)\n", err)
-		}
-	}
-
 	// IPv6: best-effort defense-in-depth (non-fatal if ip6tables unavailable)
 	if err := setupIp6tables(); err != nil {
 		fmt.Fprintf(os.Stderr, "seki: ip6tables: %v (IPv6 traffic may not be blocked)\n", err)

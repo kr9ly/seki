@@ -159,40 +159,15 @@ ip6tables -A OUTPUT -j DROP
 
 ### ネットワークのチューニング（config.json、任意）
 
-sandbox内で負荷試験を行うための設定。どちらも名前空間の中だけに効き、外向きの通信の検問は変えない。
+sandbox内で負荷試験を行うための設定。名前空間の中だけに効き、外向きの通信の検問は変えない。
 
 `netns_sysctls` は、名前空間ごとのsysctlをChildSetupで書く。この時点のプロセスは、名前空間を所有するuser namespaceのuid 0である。ユーザーコマンドは入れ子のuser namespaceで動くので、後から値を変えられない。キーは許可リスト（`internal/netns/tuning.go`）に限る。ルーティングやnetfilterに関わるキーは、検問に影響するので許可しない。
-
-`loopback_notrack` は、rawの優先度のhookでループバック通信をconntrackから外す。規則はnftで直接読み込む。
-
-```
-table ip seki_lo_notrack {
-	chain output {
-		type filter hook output priority raw; policy accept;
-		oif "lo" ip saddr 127.0.0.0/8 ip daddr 127.0.0.0/8 jump lo
-	}
-	chain lo {
-		# DNS: resolv.conf の 127.0.0.1:53 は 127.0.0.1:5353 へ DNAT されるので、追跡を残す
-		meta l4proto { tcp, udp } th dport { 53, 5353 } return
-		meta l4proto { tcp, udp } th sport { 53, 5353 } return
-		notrack
-	}
-}
-```
-
-対象を「送信元と宛先がどちらも127.0.0.0/8」に限る理由: NATを使う検問の流れは、DNS以外すべて片側がtap0のアドレスになる。プロキシへのREDIRECTと外部DNSのDNATは、送信元がtap0のアドレスのまま残る。ホストからのポートフォワードは、相手がslirpのゲートウェイになる。`oif "lo"` だけで外すと、プロキシからの応答（127.0.0.1:10200 → tap0のアドレス）のNATの逆変換が壊れる。
-
-この規則はループバックのパケット1つごとに評価されるので、短く保つ。
-
-- hookはoutputだけにする。outputでnotrackされたパケットは、loを通ってもuntrackedのまま届き、preroutingのconntrackは何もしない。送信元と宛先がどちらも127.0.0.0/8のパケットは、必ずoutputを通る
-- DNSのポートは集合で照合する。ポートごとに規則を並べない
-- iptablesの互換の経路（`-j CT --notrack`）を使わない。規則ごとのカウンタとxtの呼び出しが、パケットごとのコストになる
-
-nftが無いホストでは、同じ意味の規則をiptablesで入れる（`-m multiport --ports 53,5353` と `-j CT --notrack`）。
 
 ### 負荷試験用の名前空間（`seki isolate`）
 
 `seki isolate -- <コマンド>` は、新しいuser namespaceとnetwork namespaceでコマンドを実行する。この名前空間にはloだけがあり、netfilterの規則が無い。規則が無い名前空間にはhookが登録されないので、ループバックのパケットはconntrackも規則の評価も通らない。
+
+sandboxの名前空間の中で規則を軽くする方法は採らない。v0.5.0とv0.5.1には、ループバック通信をconntrackから外す設定（`loopback_notrack`）があった。conntrackを外しても、hookの呼び出しと規則の評価は残る。natの規則がある限り、sandboxの名前空間ではこれ以上減らせない。名前空間ごと分けると、コストがほぼ0になる。umenoya-server1での計測では、`nf_hook_slow` がnotrackの1,526〜1,759から29〜38 cycles / リクエストに下がった（2026-11-15）。この設定はv0.5.2で削除した。設定ファイルにキーが残っていても無視する。
 
 検問への影響は無い。新しい名前空間には外への経路が無く、検問する通信が存在しない。sandboxの名前空間の規則には触らない。
 

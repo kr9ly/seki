@@ -86,11 +86,6 @@ type GlobalConfig struct {
 	// and the sandboxed process cannot change them itself. Keys are limited to
 	// an allowlist in the netns package.
 	NetnsSysctls map[string]string `json:"netns_sysctls,omitempty"`
-	// LoopbackNotrack exempts sandbox-internal loopback traffic (127/8 on
-	// both ends) from connection tracking (linux backend only). Meant for
-	// load tests that run client and server inside the sandbox. Outbound
-	// inspection is unchanged.
-	LoopbackNotrack bool `json:"loopback_notrack,omitempty"`
 }
 
 // LoadGlobalConfig reads ~/.config/seki/config.json.

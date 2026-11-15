@@ -2,10 +2,7 @@
 
 package netns
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
 
 func TestValidateNetnsSysctl(t *testing.T) {
 	cases := []struct {
@@ -33,113 +30,6 @@ func TestValidateNetnsSysctl(t *testing.T) {
 		if (err == nil) != c.ok {
 			t.Errorf("validateNetnsSysctl(%q, %q) = %v, want ok=%v", c.key, c.value, err, c.ok)
 		}
-	}
-}
-
-// The notrack rules must never untrack a flow that seki NATs. These are the
-// invariants that keep inspection intact; see loopbackNotrackRuleset.
-func TestLoopbackNotrackRuleset(t *testing.T) {
-	var lines []string
-	for _, l := range strings.Split(loopbackNotrackRuleset(), "\n") {
-		if l = strings.TrimSpace(l); l != "" {
-			lines = append(lines, l)
-		}
-	}
-	index := func(want string) int {
-		t.Helper()
-		found := -1
-		for i, l := range lines {
-			if l == want {
-				if found != -1 {
-					t.Fatalf("duplicate line %q", want)
-				}
-				found = i
-			}
-		}
-		if found == -1 {
-			t.Fatalf("missing line %q in:\n%s", want, strings.Join(lines, "\n"))
-		}
-		return found
-	}
-
-	// DNS (pre-DNAT port 53, post-DNAT DNSPort) is excluded before notrack,
-	// in both directions and for both protocols.
-	ports := "{ 53, " + DNSPort + " }"
-	dport := index("meta l4proto { tcp, udp } th dport " + ports + " return")
-	sport := index("meta l4proto { tcp, udp } th sport " + ports + " return")
-	notrack := index("notrack")
-	if dport > notrack || sport > notrack {
-		t.Errorf("DNS exclusions must come before notrack:\n%s", strings.Join(lines, "\n"))
-	}
-
-	// notrack appears once, and the only way to it is limited to lo with
-	// 127/8 on both ends.
-	index(`oif "lo" ip saddr 127.0.0.0/8 ip daddr 127.0.0.0/8 jump lo`)
-	for _, l := range lines {
-		if strings.Contains(l, "notrack") && l != "notrack" && !strings.HasPrefix(l, "table ip ") {
-			t.Errorf("unexpected notrack rule: %s", l)
-		}
-		if strings.Contains(l, "jump") && !strings.HasPrefix(l, `oif "lo" ip saddr 127.0.0.0/8 ip daddr 127.0.0.0/8 `) {
-			t.Errorf("jump not limited to loopback: %s", l)
-		}
-	}
-	index("type filter hook output priority raw; policy accept;")
-}
-
-// The iptables fallback must keep the same invariants.
-func TestLoopbackNotrackIptablesRules(t *testing.T) {
-	rules := loopbackNotrackIptablesRules()
-	joined := make([]string, len(rules))
-	for i, r := range rules {
-		joined[i] = strings.Join(r, " ")
-	}
-
-	notrackIdx := -1
-	for i, r := range joined {
-		if strings.Contains(r, "--notrack") {
-			if notrackIdx != -1 {
-				t.Fatalf("more than one notrack rule: %v", joined)
-			}
-			notrackIdx = i
-			if !strings.Contains(r, "-A "+loNotrackChain+" ") {
-				t.Errorf("notrack rule outside %s: %s", loNotrackChain, r)
-			}
-		}
-	}
-	if notrackIdx == -1 {
-		t.Fatal("no notrack rule")
-	}
-
-	// --ports covers the source and the destination port.
-	for _, proto := range []string{"udp", "tcp"} {
-		want := "-A " + loNotrackChain + " -p " + proto + " -m multiport --ports 53," + DNSPort + " -j RETURN"
-		found := false
-		for _, r := range joined[:notrackIdx] {
-			if strings.Contains(r, want) {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("missing exclusion before notrack: %s", want)
-		}
-	}
-
-	// The jump into the chain is limited to lo with 127/8 on both ends.
-	jumps := 0
-	for _, r := range joined {
-		if !strings.Contains(r, "-j "+loNotrackChain) {
-			continue
-		}
-		jumps++
-		if !strings.Contains(r, "-o lo -s 127.0.0.0/8 -d 127.0.0.0/8") {
-			t.Errorf("jump not limited to loopback: %s", r)
-		}
-	}
-	if jumps != 1 {
-		t.Errorf("jumps = %d, want 1 (OUTPUT)", jumps)
-	}
-	if !strings.Contains(joined[len(joined)-1], "-j "+loNotrackChain) {
-		t.Errorf("jump rule must come last: %v", joined)
 	}
 }
 
