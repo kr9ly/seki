@@ -80,6 +80,17 @@ type GlobalConfig struct {
 	SandboxEnv     map[string]string `json:"sandbox_env"`
 	Services       []Service         `json:"services,omitempty"`
 	Bridges        []Bridge          `json:"bridges,omitempty"`
+	// NetnsSysctls lists per-network-namespace sysctls to set in the sandbox
+	// (linux backend only), e.g. {"net.ipv4.ip_local_port_range": "10240 65535"}.
+	// A new namespace starts from kernel defaults regardless of host settings,
+	// and the sandboxed process cannot change them itself. Keys are limited to
+	// an allowlist in the netns package.
+	NetnsSysctls map[string]string `json:"netns_sysctls,omitempty"`
+	// LoopbackNotrack exempts sandbox-internal loopback traffic (127/8 on
+	// both ends) from connection tracking (linux backend only). Meant for
+	// load tests that run client and server inside the sandbox. Outbound
+	// inspection is unchanged.
+	LoopbackNotrack bool `json:"loopback_notrack,omitempty"`
 }
 
 // LoadGlobalConfig reads ~/.config/seki/config.json.

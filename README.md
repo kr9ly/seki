@@ -241,7 +241,11 @@ seki host-port add 9222
       "ready_socket": "$XDG_RUNTIME_DIR/podman/podman.sock",
       "ready_timeout_sec": 15
     }
-  ]
+  ],
+  "netns_sysctls": {
+    "net.ipv4.ip_local_port_range": "10240 65535"
+  },
+  "loopback_notrack": false
 }
 ```
 
@@ -256,6 +260,15 @@ seki host-port add 9222
 - `services`: sandbox 内常駐サービス。`match` にマッチした cwd のセッションだけ起動。
   PID namespace で sandbox 終了時に道連れ保証。ログは `~/.cache/seki/services/<name>.log`。
   詳細は [recipes/services.md](recipes/services.md)
+- `netns_sysctls`: sandboxのネットワーク名前空間に書くsysctl（Linuxのみ）。
+  新しい名前空間はカーネルの既定値で始まり、ホストの設定は引き継がれない。
+  sandbox内のプロセスは自分では変えられない。指定できるキーは
+  `net.ipv4.ip_local_port_range`、`net.core.somaxconn`、`net.ipv4.tcp_max_syn_backlog`。
+  それ以外のキーは警告を出して無視する
+- `loopback_notrack`: sandbox内のループバック通信をconntrackから外す（Linuxのみ、既定は `false`）。
+  sandbox内でサーバーと負荷ツールを動かす計測向け。対象は送信元と宛先がどちらも
+  `127.0.0.0/8` の通信で、DNS（ポート53と5353）は除く。外向きの通信の検問は変わらない。
+  IPv6の `::1` はもともとconntrackを通らない
 
 ## 8. rules.json 完全プリセット（コピペ用）
 

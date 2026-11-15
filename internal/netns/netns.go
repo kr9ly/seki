@@ -434,6 +434,14 @@ func ChildSetup() (*ChildState, error) {
 		return nil, fmt.Errorf("loopback up: %w", err)
 	}
 
+	// Network tuning from config.json. Config errors are non-fatal here;
+	// Exec already reported them.
+	tuning, err := profile.LoadGlobalConfig()
+	if err != nil {
+		tuning = &profile.GlobalConfig{}
+	}
+	applyNetnsSysctls(tuning.NetnsSysctls)
+
 	// Override /etc/resolv.conf to point to seki's DNS resolver
 	if err := overrideResolvConf(); err != nil {
 		return nil, fmt.Errorf("override resolv.conf: %w", err)
@@ -651,6 +659,13 @@ func ChildSetup() (*ChildState, error) {
 	if err := setupIptables(); err != nil {
 		cs.Close()
 		return nil, fmt.Errorf("iptables: %w", err)
+	}
+
+	// Opt-in: take sandbox-internal loopback traffic out of conntrack.
+	if tuning.LoopbackNotrack {
+		if err := setupLoopbackNotrack(); err != nil {
+			fmt.Fprintf(os.Stderr, "seki: loopback_notrack: %v (loopback stays tracked)\n", err)
+		}
 	}
 
 	// IPv6: best-effort defense-in-depth (non-fatal if ip6tables unavailable)

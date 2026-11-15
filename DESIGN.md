@@ -157,6 +157,25 @@ ip6tables -A OUTPUT -d ::1/128 -j ACCEPT
 ip6tables -A OUTPUT -j DROP
 ```
 
+### ネットワークのチューニング（config.json、任意）
+
+sandbox内で負荷試験を行うための設定。どちらも名前空間の中だけに効き、外向きの通信の検問は変えない。
+
+`netns_sysctls` は、名前空間ごとのsysctlをChildSetupで書く。この時点のプロセスは、名前空間を所有するuser namespaceのuid 0である。ユーザーコマンドは入れ子のuser namespaceで動くので、後から値を変えられない。キーは許可リスト（`internal/netns/tuning.go`）に限る。ルーティングやnetfilterに関わるキーは、検問に影響するので許可しない。
+
+`loopback_notrack` は、rawテーブルでループバック通信をconntrackから外す。
+
+```bash
+iptables -t raw -N SEKI_LO_NOTRACK
+# DNS: resolv.conf の 127.0.0.1:53 は 127.0.0.1:5353 へ DNAT されるので、追跡を残す
+iptables -t raw -A SEKI_LO_NOTRACK -p {udp,tcp} {--dport,--sport} {53,5353} -j RETURN
+iptables -t raw -A SEKI_LO_NOTRACK -j CT --notrack
+iptables -t raw -A OUTPUT     -o lo -s 127.0.0.0/8 -d 127.0.0.0/8 -j SEKI_LO_NOTRACK
+iptables -t raw -A PREROUTING -i lo -s 127.0.0.0/8 -d 127.0.0.0/8 -j SEKI_LO_NOTRACK
+```
+
+対象を「送信元と宛先がどちらも127.0.0.0/8」に限る理由: NATを使う検問の流れは、DNS以外すべて片側がtap0のアドレスになる。プロキシへのREDIRECTと外部DNSのDNATは、送信元がtap0のアドレスのまま残る。ホストからのポートフォワードは、相手がslirpのゲートウェイになる。`-o lo` だけで外すと、プロキシからの応答（127.0.0.1:10200 → tap0のアドレス）のNATの逆変換が壊れる。
+
 ### ホスト安全性保証
 
 seki が crash・SIGKILL されてもホスト環境を破壊しないことを構造的に保証する。
