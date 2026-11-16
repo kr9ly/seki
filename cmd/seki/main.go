@@ -815,20 +815,25 @@ func checkCommand(cmd string) {
 	}
 
 	res := rs.EvaluateCommand(cmd)
+	// Every refusal names the rule and the command it matched, so that a
+	// false positive can be traced to a rule.
+	reason := func() {
+		if r := res.Reason(); r != "" {
+			fmt.Fprintf(os.Stderr, "[seki]   %s\n", r)
+		}
+	}
 	switch res.Action {
 	case rules.Allow:
 		return
 	case rules.Deny:
-		tag := ""
-		if res.Rule != nil && res.Rule.Tag != "" {
-			tag = " [" + res.Rule.Tag + "]"
-		}
-		fmt.Fprintf(os.Stderr, "[seki] blocked: %s%s\n", cmd, tag)
+		fmt.Fprintf(os.Stderr, "[seki] blocked: %s\n", cmd)
+		reason()
 		os.Exit(2)
 	case rules.Prompt:
 		client, err := socket.Connect(false)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[seki] blocked (no watch): %s\n", cmd)
+			reason()
 			os.Exit(2)
 		}
 		defer client.Close()
@@ -864,6 +869,7 @@ func checkCommand(cmd string) {
 			case e, ok := <-events:
 				if !ok {
 					fmt.Fprintf(os.Stderr, "[seki] blocked (disconnected): %s\n", cmd)
+					reason()
 					os.Exit(2)
 				}
 				if e.Command == cmd {
@@ -872,11 +878,13 @@ func checkCommand(cmd string) {
 						return
 					case "cmd_deny":
 						fmt.Fprintf(os.Stderr, "[seki] denied: %s\n", cmd)
+						reason()
 						os.Exit(2)
 					}
 				}
 			case <-timeout:
 				fmt.Fprintf(os.Stderr, "[seki] blocked (timeout): %s\n", cmd)
+				reason()
 				os.Exit(2)
 			}
 		}

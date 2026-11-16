@@ -111,7 +111,14 @@ seki mode enforce
 
 - **マッチング**: Go 正規表現（JSON 内なので `\b` は `\\b` にエスケープ）
 - `"kind": "command"` を付ける。CLI では `--command` フラグ
-- 評価はファーストマッチ。**deny を prompt より先に**書く（例: `git push --force` deny → `git push` prompt の順）
+- 判定の単位はコマンド。コマンド行をシェルの構文で解析し、`&&`・`;`・パイプ・`$(…)` で区切られた各コマンドに、規則を1つずつ適用する。`^` は各コマンドの先頭にマッチする
+- 規則は `^コマンド名` で始める。先頭に固定しない規則は、別のコマンドの引数に書かれた文字列にもマッチする（例: `echo` や `git commit -m` の引数）
+- データは判定の対象にならない。ヒアドキュメントの本文は無視される。`ssh ホスト '…'` の中身は `ssh` の引数として扱われ、手元の規則では判定されない
+- データがコマンドになる経路は解析し直す。対象は `bash -c`・`sh -c`・`eval`・`find -exec` と、`env`・`sudo`・`nice`・`timeout`・`xargs` などの後ろのコマンド
+- 解析できない行は、行全体にも規則を適用する。構文エラーの行と、コマンド名が変数展開の行が該当する
+- 1つのコマンドの中ではファーストマッチ。**deny を prompt より先に**書く（例: `git push --force` deny → `git push` prompt の順）
+- コマンドが複数あるときは、最も厳しい結果を採る（deny > prompt > allow）
+- 拒否のときは、マッチした規則・コマンド・何番目のコマンドかを表示する
 - prompt は `seki watch` の承認キューへ。`SEKI_APPROVAL_TIMEOUT`（デフォルト 30 秒）超過で deny
 
 ### 必須プリセット
@@ -121,8 +128,8 @@ dogfooding で確立した実戦セット。新環境ではこれを丸ごと入
 **デプロイ・公開系（prompt = 都度承認）**
 
 ```json
-{ "match": "\\bgit\\b.*\\bpush\\b.*--force", "action": "deny",   "tag": "deploy", "kind": "command" },
-{ "match": "\\bgit\\b.*\\bpush\\b",          "action": "prompt", "tag": "deploy", "kind": "command" },
+{ "match": "^git\\b(\\s+-C\\s+\\S+|\\s+--?\\S+)*\\s+push\\b.*\\s--force", "action": "deny",   "tag": "deploy", "kind": "command" },
+{ "match": "^git\\b(\\s+-C\\s+\\S+|\\s+--?\\S+)*\\s+push\\b",          "action": "prompt", "tag": "deploy", "kind": "command" },
 { "match": "^npm publish",                    "action": "prompt", "tag": "deploy", "kind": "command" },
 { "match": "^npx.*publish",                   "action": "prompt", "tag": "deploy", "kind": "command" },
 { "match": "^(sam|cdk) deploy",               "action": "prompt", "tag": "deploy", "kind": "command" },
@@ -157,7 +164,7 @@ create/delete/...` prompt、`gh api -X POST/PUT/PATCH/DELETE` prompt。
 
 ```json
 { "match": "^(sudo\\s+)?(apt|apt-get)\\s+install",   "action": "deny",   "tag": "pkg-manager", "kind": "command" },
-{ "match": "npm\\s+(i|install)\\b.*(-g|--global)",   "action": "deny",   "tag": "pkg-manager", "kind": "command" },
+{ "match": "^npm\\s+(i|install)\\b.*\\s(-g|--global)\\b",   "action": "deny",   "tag": "pkg-manager", "kind": "command" },
 { "match": "^gem\\s+install",                         "action": "deny",   "tag": "pkg-manager", "kind": "command" },
 { "match": "^go\\s+install\\s+\\S+@",                 "action": "prompt", "tag": "pkg-manager", "kind": "command" },
 { "match": "^pip3?\\s+install",                       "action": "prompt", "tag": "pkg-manager", "kind": "command" },
@@ -183,7 +190,7 @@ create/delete/...` prompt、`gh api -X POST/PUT/PATCH/DELETE` prompt。
 **git worktree 禁止**（worktree 作成時に main の HEAD が巻き戻る事故の前歴あり）:
 
 ```json
-{ "match": "\\bgit\\b.*\\bworktree\\b", "action": "deny", "tag": "worktree", "kind": "command" }
+{ "match": "^git\\b(\\s+-C\\s+\\S+|\\s+--?\\S+)*\\s+worktree\\b", "action": "deny", "tag": "worktree", "kind": "command" }
 ```
 
 ## 6. ポート解放 — `forward` と `host-port` は方向が逆
@@ -310,8 +317,8 @@ sandboxの名前空間には検問の規則があり、ループバックのパ�
     { "match": "192.168.0.0/16", "action": "allow", "tag": "private" },
     { "match": "*", "action": "prompt" },
 
-    { "match": "\\bgit\\b.*\\bpush\\b.*--force", "action": "deny", "tag": "deploy", "kind": "command" },
-    { "match": "\\bgit\\b.*\\bpush\\b", "action": "prompt", "tag": "deploy", "kind": "command" },
+    { "match": "^git\\b(\\s+-C\\s+\\S+|\\s+--?\\S+)*\\s+push\\b.*\\s--force", "action": "deny", "tag": "deploy", "kind": "command" },
+    { "match": "^git\\b(\\s+-C\\s+\\S+|\\s+--?\\S+)*\\s+push\\b", "action": "prompt", "tag": "deploy", "kind": "command" },
     { "match": "^npm publish", "action": "prompt", "tag": "deploy", "kind": "command" },
     { "match": "^npx.*publish", "action": "prompt", "tag": "deploy", "kind": "command" },
     { "match": "^(sam|cdk) deploy", "action": "prompt", "tag": "deploy", "kind": "command" },
@@ -322,7 +329,7 @@ sandboxの名前空間には検問の規則があり、ループバックのパ�
     { "match": "^aws s3 (rm|rb)", "action": "deny", "tag": "destroy", "kind": "command" },
     { "match": "^(curl|wget).*-X\\s*(POST|PUT|DELETE|PATCH)", "action": "prompt", "tag": "http-write", "kind": "command" },
     { "match": "^(sudo\\s+)?(apt|apt-get)\\s+install", "action": "deny", "tag": "pkg-manager", "kind": "command" },
-    { "match": "npm\\s+(i|install)\\b.*(-g|--global)", "action": "deny", "tag": "pkg-manager", "kind": "command" },
+    { "match": "^npm\\s+(i|install)\\b.*\\s(-g|--global)\\b", "action": "deny", "tag": "pkg-manager", "kind": "command" },
     { "match": "^gem\\s+install", "action": "deny", "tag": "pkg-manager", "kind": "command" },
     { "match": "^go\\s+install\\s+\\S+@", "action": "prompt", "tag": "pkg-manager", "kind": "command" },
     { "match": "^pip3?\\s+install", "action": "prompt", "tag": "pkg-manager", "kind": "command" },

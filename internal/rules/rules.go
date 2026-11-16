@@ -44,6 +44,11 @@ type Result struct {
 	Action  string
 	Rule    *Rule
 	Learned bool // true if denied but learning_mode is on (not actually blocked)
+
+	// Command rules only: the command that matched, and its 1-based position
+	// among the commands of the line. 0 means the raw line was matched.
+	Command      string
+	CommandIndex int
 }
 
 // Load reads rules from ~/.config/seki/rules.json.
@@ -182,20 +187,64 @@ func (rs *RuleSet) Evaluate(domain, ip string) Result {
 	return res
 }
 
-// EvaluateCommand checks a command string against command rules.
-// First matching rule wins. Default: allow (blacklist).
+// EvaluateCommand checks a shell command line against command rules.
+//
+// The line is split into the simple commands it would execute (see
+// commandUnits) and each one is matched on its own: first matching rule wins
+// per command, and the strictest outcome across commands wins overall
+// (deny > prompt > allow). Default: allow (blacklist).
+//
+// When the line cannot be resolved statically, the raw string is matched as
+// well, as one more unit with index 0.
 func (rs *RuleSet) EvaluateCommand(cmd string) Result {
-	for i := range rs.Rules {
-		r := &rs.Rules[i]
-		if r.Kind != KindCommand {
-			continue
-		}
-		if matchCommand(r.Match, cmd) {
-			return Result{Action: r.Action, Rule: r}
+	units, ok := commandUnits(cmd)
+	best := Result{Action: Allow}
+	consider := func(unit string, index int) {
+		for i := range rs.Rules {
+			r := &rs.Rules[i]
+			if r.Kind != KindCommand || !matchCommand(r.Match, unit) {
+				continue
+			}
+			if actionSeverity(r.Action) > actionSeverity(best.Action) {
+				best = Result{Action: r.Action, Rule: r, Command: unit, CommandIndex: index}
+			}
+			return // first match wins for this command
 		}
 	}
-	// Default allow (blacklist)
-	return Result{Action: Allow}
+	for i, u := range units {
+		consider(u, i+1)
+	}
+	if !ok {
+		consider(cmd, 0)
+	}
+	return best
+}
+
+func actionSeverity(action string) int {
+	switch action {
+	case Deny:
+		return 2
+	case Prompt:
+		return 1
+	}
+	return 0
+}
+
+// Reason describes which rule matched which command, for display.
+// Empty when no command rule matched.
+func (r Result) Reason() string {
+	if r.Rule == nil || r.Rule.Kind != KindCommand {
+		return ""
+	}
+	where := "whole line (could not be parsed into commands)"
+	if r.CommandIndex > 0 {
+		where = fmt.Sprintf("command #%d", r.CommandIndex)
+	}
+	tag := ""
+	if r.Rule.Tag != "" {
+		tag = " [" + r.Rule.Tag + "]"
+	}
+	return fmt.Sprintf("rule %q%s matched %s: %s", r.Rule.Match, tag, where, r.Command)
 }
 
 // AddRule appends or updates a rule, then re-sorts by specificity so that
@@ -252,9 +301,9 @@ func Policies() map[string]Policy {
 		"gh-write": {
 			Description: "Prompt for GitHub CLI write operations",
 			Rules: []Rule{
-				{Match: `\bgh\s+(pr|issue)\s+(create|merge|close|comment|edit|review|reopen|delete|ready)\b`, Action: Prompt, Tag: "gh-write", Kind: KindCommand},
-				{Match: `\bgh\s+(release|repo|gist|label)\s+(create|delete|edit|rename|fork|archive)\b`, Action: Prompt, Tag: "gh-write", Kind: KindCommand},
-				{Match: `\bgh\s+api\b.*(-X|--method)\s+(POST|PUT|PATCH|DELETE)\b`, Action: Prompt, Tag: "gh-write", Kind: KindCommand},
+				{Match: `^gh\s+(pr|issue)\s+(create|merge|close|comment|edit|review|reopen|delete|ready)\b`, Action: Prompt, Tag: "gh-write", Kind: KindCommand},
+				{Match: `^gh\s+(release|repo|gist|label)\s+(create|delete|edit|rename|fork|archive)\b`, Action: Prompt, Tag: "gh-write", Kind: KindCommand},
+				{Match: `^gh\s+api\b.*(-X|--method)\s+(POST|PUT|PATCH|DELETE)\b`, Action: Prompt, Tag: "gh-write", Kind: KindCommand},
 			},
 		},
 	}

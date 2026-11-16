@@ -4,8 +4,9 @@ go 1.26.1
 
 require (
 	github.com/miekg/dns v1.1.72
-	golang.org/x/sys v0.42.0
+	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.48.1
+	mvdan.cc/sh/v3 v3.14.1
 )
 
 require (
